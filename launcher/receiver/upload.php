@@ -27,7 +27,7 @@ if (!is_dir($dir) && !@mkdir($dir, 0755, true)) {
 }
 $ht = $dir . DIRECTORY_SEPARATOR . '.htaccess';
 if (!is_file($ht)) {
-    @file_put_contents($ht, "Options -Indexes\n<FilesMatch \"\\.(php[0-9]?|phtml|phar|cgi|pl|py|sh)$\">\n  Require all denied\n</FilesMatch>\n");
+    @file_put_contents($ht, "Options -Indexes\n<FilesMatch \"\\.(php[0-9]?|phtml|phar|pht|cgi|pl|py|sh)(\\.|$)\">\n  Require all denied\n</FilesMatch>\n<IfModule mod_php.c>\n  php_flag engine off\n</IfModule>\n");
 }
 
 $action = isset($_GET['action']) ? (string)$_GET['action'] : '';
@@ -49,7 +49,9 @@ if ($action === 'list') {
 }
 
 $name = isset($_GET['file']) ? (string)$_GET['file'] : '';
-if (!preg_match('/^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,150}\.(zip|json|jpg|jpeg|png|webp)$/', $name)) {
+if (!preg_match('/^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,150}\.(zip|json|jpg|jpeg|png|webp)$/', $name)
+    // Some Apache setups run "x.php.zip" as PHP: refuse script extensions anywhere in the name.
+    || preg_match('/\.(php[0-9]?|phtml|phar|pht|cgi|pl|py|sh|asp|aspx|jsp|htaccess)(\.|$)/i', $name)) {
     out(400, ['error' => 'nome de arquivo inválido']);
 }
 $final = $dir . DIRECTORY_SEPARATOR . $name;

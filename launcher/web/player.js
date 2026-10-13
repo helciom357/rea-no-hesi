@@ -1,5 +1,5 @@
 // Player app: servers grouped by track, room page, my mods, settings.
-const S = { hub: null, statuses: {}, modes: [], live: {}, acValid: true, hubError: '', job: null, sel: {}, mods: null, modFilter: 'all', modQuery: '', state: null };
+const S = { autoJoin: null, hub: null, statuses: {}, modes: [], live: {}, acValid: true, hubError: '', job: null, sel: {}, mods: null, modFilter: 'all', modQuery: '', state: null };
 const main = document.getElementById('main');
 
 // ---- navigation -------------------------------------------------------------
@@ -23,10 +23,24 @@ function route() {
 function render() {
   const { page, arg } = route();
   const scroll = main.scrollTop;
+  const focused = document.activeElement?.id === 'modSearch' ? document.activeElement : null;
+  const caret = focused ? [focused.selectionStart, focused.selectionEnd] : null;
   const view = page === 'sala' ? roomPage(arg) : page === 'mods' ? modsPage() : page === 'ajustes' ? settingsPage() : serversPage();
   main.replaceChildren(view);
   main.scrollTop = scroll;
+  if (focused) {
+    const q = document.getElementById('modSearch');
+    q?.focus();
+    q?.setSelectionRange(...caret);
+  }
   renderFloat();
+}
+
+// Background updates (live status, install progress) must not wipe what the
+// player is typing in Ajustes; there only the floating progress is updated.
+function refresh() {
+  if (route().page === 'ajustes') renderFloat();
+  else render();
 }
 window.addEventListener('hashchange', () => { main.scrollTop = 0; if (route().page === 'mods') loadMods(); render(); });
 
@@ -40,17 +54,17 @@ async function loadHub() {
     S.hub = null;
     S.hubError = e.message;
   }
-  render();
+  refresh();
 }
 
 async function loadLive() {
   if (!S.hub) return;
-  try { S.live = await api('/api/live'); render(); } catch { /* keep last */ }
+  try { S.live = await api('/api/live'); refresh(); } catch { /* keep last */ }
 }
 
 async function loadMods() {
   try { S.mods = await api('/api/mods'); } catch (e) { toast(e.message, true); }
-  if (route().page === 'mods') render();
+  if (route().page === 'mods') refresh();
 }
 
 const modeName = (id) => S.modes.find((m) => m.id === id)?.name || id;
@@ -118,7 +132,7 @@ function serverCard(g) {
     st.ready ? h('span', { class: 'chip' }, icon('check'), 'pronto') : h('span', { class: 'chip', style: 'color:var(--warn)' }, icon('download'), `falta ${st.pending}`));
   const action = st.ready
     ? h('button', { class: 'btn primary', onclick: () => join(room) }, icon('play'), `Jogar ${modeName(room.modeId)}`)
-    : h('button', { class: 'btn white', disabled: !S.acValid || running(), onclick: () => { open(); install({ roomIds: [room.id] }); } }, icon('download'), 'Baixar e jogar');
+    : h('button', { class: 'btn white', disabled: !S.acValid || running(), onclick: () => { S.autoJoin = room.id; open(); install({ roomIds: [room.id] }); } }, icon('download'), 'Baixar e jogar');
   return h('article', { class: 'scard' },
     bgImage([room.image, room.track.image, localImg('track', room.track.id)]),
     tabs,
@@ -236,7 +250,7 @@ function modsPage() {
   const seg = h('div', { class: 'seg' }, Object.keys(labels).map((k) => h('button', {
     'aria-pressed': String(S.modFilter === k), onclick: () => { S.modFilter = k; render(); },
   }, labels[k], h('b', {}, counts[k]))));
-  const q = h('input', { type: 'search', placeholder: 'Buscar por nome ou pasta…', oninput: (e) => { S.modQuery = e.target.value.toLowerCase(); drawGrid(); } });
+  const q = h('input', { type: 'search', id: 'modSearch', placeholder: 'Buscar por nome ou pasta…', oninput: (e) => { S.modQuery = e.target.value.toLowerCase(); drawGrid(); } });
   q.value = S.modQuery;
   page.append(h('div', { style: 'display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px' }, h('label', { class: 'search' }, icon('search'), q), seg));
   const grid = h('div', { class: 'cards' });
@@ -316,12 +330,15 @@ function pollJob() {
   clearTimeout(jobTimer);
   jobTimer = setTimeout(async () => {
     try { S.job = await api('/api/job'); } catch { return pollJob(); }
-    if (running()) { render(); pollJob(); return; }
+    if (running()) { refresh(); pollJob(); return; }
     const errs = S.job?.items.filter((p) => p.phase === 'error') || [];
     if (S.job?.status === 'done') toast('Conteúdo instalado.');
     else if (errs.length) toast(`${errs[0].name || errs[0].id}: ${errs[0].error}`, true);
     await loadHub();
     if (route().page === 'mods') loadMods();
+    const auto = S.autoJoin;
+    S.autoJoin = null;
+    if (auto && S.job?.status === 'done' && S.statuses[auto]?.ready) join(roomById(auto));
   }, 500);
 }
 

@@ -1,2 +1,4 @@
 dist/
 *.exe
+# binário gerado por "go build" nesta pasta
+/launcher
