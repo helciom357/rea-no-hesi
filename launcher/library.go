@@ -22,18 +22,19 @@ import (
 // LibItem is one car or track the admin has added to the base. Each item is
 // stored as its own normalized package: content/<cars|tracks>/<id>/...
 type LibItem struct {
-	Kind        string    `json:"kind"`
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Version     string    `json:"version"`
-	File        string    `json:"file"`
-	SHA256      string    `json:"sha256"`
-	Size        int64     `json:"size"`
-	Layouts     []string  `json:"layouts,omitempty"`
-	Image       string    `json:"image,omitempty"` // file name under img/
-	Fingerprint string    `json:"fingerprint"`     // content hash ignoring the version field
-	Uploaded    bool      `json:"uploaded"`        // package + image are on the remote base
-	UpdatedAt   time.Time `json:"updatedAt"`
+	Kind        string      `json:"kind"`
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	Version     string      `json:"version"`
+	File        string      `json:"file"`
+	SHA256      string      `json:"sha256"`
+	Size        int64       `json:"size"`
+	Layouts     []string    `json:"layouts,omitempty"`
+	Image       string      `json:"image,omitempty"`  // file name under img/
+	Fingerprint string      `json:"fingerprint"`      // content hash ignoring the version field
+	Checks      []FileCheck `json:"checks,omitempty"` // what decides "same files as the server"
+	Uploaded    bool        `json:"uploaded"`         // package + image are on the remote base
+	UpdatedAt   time.Time   `json:"updatedAt"`
 }
 
 func (i LibItem) Key() string { return i.Kind + ":" + i.ID }
@@ -227,6 +228,7 @@ func (l *Library) importOne(zr *zip.ReadCloser, names []string, f found) (Import
 	var files []*zip.File
 	var rels []string
 	var fpLines []string
+	var pkgFiles []PkgFile
 	zipVersion, name := "", ""
 	for i, zf := range zr.File {
 		n := names[i]
@@ -240,6 +242,7 @@ func (l *Library) importOne(zr *zip.ReadCloser, names []string, f found) (Import
 		}
 		files = append(files, zf)
 		rels = append(rels, clean)
+		pkgFiles = append(pkgFiles, PkgFile{Rel: clean, Size: int64(zf.UncompressedSize64), CRC32: zf.CRC32})
 		base := strings.ToLower(path.Base(clean))
 		if uiNames[base] {
 			b := readZipFile(zf, 1<<20)
@@ -269,7 +272,7 @@ func (l *Library) importOne(zr *zip.ReadCloser, names []string, f found) (Import
 		}
 	}
 	l.mu.Unlock()
-	if had && prev.Fingerprint == fingerprint && exists(filepath.Join(l.dir, prev.File)) {
+	if had && prev.Fingerprint == fingerprint && len(prev.Checks) > 0 && exists(filepath.Join(l.dir, prev.File)) {
 		return ImportResult{Item: prev, Status: "unchanged"}, nil
 	}
 	version := zipVersion
@@ -287,24 +290,34 @@ func (l *Library) importOne(zr *zip.ReadCloser, names []string, f found) (Import
 	if f.kind == "track" {
 		sub = "tracks"
 	}
-	file := f.kind + "-" + f.id + ".zip"
-	dst := filepath.Join(l.dir, file)
-	tmp := dst + ".tmp"
+	// Packages are named by their hash: two hosts with different versions of
+	// the same mod never overwrite each other on the base.
+	tmp := filepath.Join(l.dir, f.kind+"-"+f.id+".zip.tmp")
 	if err := writePackage(tmp, files, rels, "content/"+sub+"/"+f.id+"/", version, uiNames); err != nil {
 		os.Remove(tmp)
 		return ImportResult{}, err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		return ImportResult{}, err
-	}
-	sum, err := fileSHA256(dst)
+	sum, err := fileSHA256(tmp)
 	if err != nil {
+		os.Remove(tmp)
 		return ImportResult{}, err
 	}
-	st, _ := os.Stat(dst)
+	stem := f.kind + "-" + f.id + "-" + sum[:12]
+	file := stem + ".zip"
+	if err := os.Rename(tmp, filepath.Join(l.dir, file)); err != nil {
+		return ImportResult{}, err
+	}
+	st, _ := os.Stat(filepath.Join(l.dir, file))
 	item := LibItem{Kind: f.kind, ID: f.id, Name: name, Version: version, File: file, SHA256: sum,
-		Size: st.Size(), Layouts: f.layouts, Fingerprint: fingerprint, UpdatedAt: time.Now()}
-	item.Image = l.saveImage(f.kind, f.id, files, rels, f.layouts)
+		Size: st.Size(), Layouts: f.layouts, Fingerprint: fingerprint, UpdatedAt: time.Now(),
+		Checks: ChecksFromList(f.kind, pkgFiles)}
+	item.Image = l.saveImage(stem, files, rels, f.kind, f.layouts)
+	if had && prev.File != "" && prev.File != item.File {
+		_ = os.Remove(filepath.Join(l.dir, prev.File))
+		if prev.Image != "" && prev.Image != item.Image {
+			_ = os.Remove(filepath.Join(l.dir, "img", prev.Image))
+		}
+	}
 
 	l.mu.Lock()
 	replaced := false
@@ -412,7 +425,7 @@ func uiField(b []byte, re *regexp.Regexp) string {
 
 // saveImage keeps a preview for the cards: the first skin preview of a car,
 // or the track preview.
-func (l *Library) saveImage(kind, id string, files []*zip.File, rels []string, layouts []string) string {
+func (l *Library) saveImage(stem string, files []*zip.File, rels []string, kind string, layouts []string) string {
 	var cands []string
 	if kind == "car" {
 		var skins []string
@@ -439,7 +452,7 @@ func (l *Library) saveImage(kind, id string, files []*zip.File, rels []string, l
 			if len(b) == 0 {
 				continue
 			}
-			name := kind + "-" + id + strings.ToLower(path.Ext(r))
+			name := stem + strings.ToLower(path.Ext(r))
 			if os.WriteFile(filepath.Join(l.dir, "img", name), b, 0o644) == nil {
 				return name
 			}

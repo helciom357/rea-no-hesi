@@ -2,25 +2,22 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Publisher runs the admin's background work in order: import dropped zips,
-// upload packages and publish hub.json. Everything the admin does goes live
-// without a separate "export" step.
+// Publisher runs the host's background work in order: import dropped zips
+// into the local library, and publish events (uploading the packages they
+// use first).
 type Publisher struct {
 	lib *Library
 	act *Activity
 
-	mu             sync.Mutex
-	publishPending bool
-	lastError      string
+	mu        sync.Mutex
+	lastError string
 }
 
 func NewPublisher(lib *Library) *Publisher {
@@ -87,142 +84,82 @@ func (p *Publisher) Import(tmpPath, label string, removeAfter bool) *Task {
 				t.State = "done"
 			}
 		})
-		for _, r := range results {
-			if !r.Item.Uploaded {
-				p.queueUpload(r.Item)
-			}
-		}
-		if len(results) > 0 {
-			p.SchedulePublish()
-		}
 	})
 	return t
 }
 
-func (p *Publisher) queueUpload(it LibItem) {
-	if p.remote() == nil {
-		return // stays local until the connection is set
-	}
-	t := p.act.Add("upload", "Enviando "+it.Name)
-	p.act.Enqueue(func() { p.upload(t, it) })
-}
-
-func (p *Publisher) upload(t *Task, it LibItem) {
-	r := p.remote()
-	cur, ok := p.lib.Get(it.Kind, it.ID)
-	if r == nil || !ok || cur.SHA256 != it.SHA256 {
-		p.act.Set(t, func(t *Task) { t.State, t.Detail = "done", "substituído por uma versão mais nova" })
-		return
-	}
-	p.act.Set(t, func(t *Task) { t.State, t.Total = "running", cur.Size })
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
-	defer cancel()
-	err := r.Upload(ctx, fileOpener(p.lib.Path(cur)), cur.File, cur.SHA256, func(done, total int64) {
-		p.act.Set(t, func(t *Task) { t.Done, t.Total = done, total })
-	})
-	if err == nil && cur.Image != "" {
-		sum, _ := fileSHA256(p.lib.ImagePath(cur))
-		err = r.Upload(ctx, fileOpener(p.lib.ImagePath(cur)), cur.RemoteImage(), sum, func(int64, int64) {})
-	}
-	p.act.Set(t, func(t *Task) {
-		if err != nil {
-			t.State, t.Error = "error", err.Error()
-		} else {
-			t.State, t.Done = "done", t.Total
-		}
-	})
-	if err == nil {
-		p.lib.MarkUploaded(cur.Kind, cur.ID, cur.SHA256)
-	}
-}
-
-// SyncAll uploads everything not yet on the site and republishes; used right
-// after the connection is configured.
-func (p *Publisher) SyncAll() {
-	for _, it := range p.lib.List() {
-		if !it.Uploaded {
-			p.queueUpload(it)
-		}
-	}
-	p.SchedulePublish()
-}
-
-// SchedulePublish coalesces publish requests: many quick edits produce one
-// upload of hub.json after the pending uploads.
-func (p *Publisher) SchedulePublish() {
-	p.mu.Lock()
-	if p.publishPending {
-		p.mu.Unlock()
-		return
-	}
-	p.publishPending = true
-	p.mu.Unlock()
-	if p.remote() == nil {
-		p.mu.Lock()
-		p.publishPending = false
-		p.mu.Unlock()
-		return
-	}
-	t := p.act.Add("publish", "Publicando a base")
-	p.act.Enqueue(func() {
-		p.mu.Lock()
-		p.publishPending = false
-		p.mu.Unlock()
-		p.publish(t)
-	})
-}
-
-func (p *Publisher) publish(t *Task) {
-	p.act.Set(t, func(t *Task) { t.State = "running" })
-	fail := func(err error) {
-		p.mu.Lock()
-		p.lastError = err.Error()
-		p.mu.Unlock()
-		p.act.Set(t, func(t *Task) { t.State, t.Error = "error", err.Error() })
-	}
+// PublishEvent uploads the packages the event uses that are not on the base
+// yet, then saves the event. The task reports progress to the panel.
+func (p *Publisher) PublishEvent(d EventDraft) (*Task, error) {
 	r := p.remote()
 	if r == nil {
-		fail(fmt.Errorf("conexão com o site não configurada"))
-		return
+		return nil, fmt.Errorf("ligue o painel a uma base primeiro")
 	}
-	s := LoadSettings()
-	base, err := LoadAdminBase(s.AdminBase)
-	if err != nil {
-		fail(err)
-		return
+	if _, err := BuildEvent(d, p.lib); err != nil {
+		return nil, err
 	}
-	// Content used by rooms must be online before the hub points at it.
-	for _, it := range ReferencedItems(base, p.lib) {
-		if !it.Uploaded {
-			sub := p.act.Add("upload", "Enviando "+it.Name)
-			p.upload(sub, it)
-			if cur, _ := p.lib.Get(it.Kind, it.ID); !cur.Uploaded {
-				fail(fmt.Errorf("não foi possível enviar %s", it.Name))
-				return
+	t := p.act.Add("publish", "Publicando "+strings.TrimSpace(d.Name))
+	p.act.Enqueue(func() {
+		p.act.Set(t, func(t *Task) { t.State = "running" })
+		fail := func(err error) {
+			p.mu.Lock()
+			p.lastError = err.Error()
+			p.mu.Unlock()
+			p.act.Set(t, func(t *Task) { t.State, t.Error = "error", err.Error() })
+		}
+		items := d.Items(p.lib)
+		var total int64
+		for _, it := range items {
+			if !it.Uploaded {
+				total += it.Size
 			}
 		}
-	}
-	hub := BuildHub(base, p.lib, r.FilesURL())
-	b, _ := json.MarshalIndent(hub, "", "  ")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	sum := sha256Hex(b)
-	if err := r.Upload(ctx, bytesOpener(b), "hub.json", sum, func(int64, int64) {}); err != nil {
-		fail(err)
-		return
-	}
-	// Keep a local copy next to the base for reference and offline testing.
-	_ = os.WriteFile(filepath.Join(filepath.Dir(s.AdminBase), "hub.json"), b, 0o644)
-	p.mu.Lock()
-	p.lastError = ""
-	p.mu.Unlock()
-	p.act.mu.Lock()
-	p.act.PublishedAt = time.Now()
-	p.act.mu.Unlock()
-	p.act.Set(t, func(t *Task) {
-		t.State = "done"
-		t.Detail = fmt.Sprintf("%d sala(s) no ar", len(hub.Rooms))
+		var done int64
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Hour)
+		defer cancel()
+		for _, it := range items {
+			if it.Uploaded {
+				continue
+			}
+			p.act.Set(t, func(t *Task) { t.Detail, t.Total = "Enviando "+it.Name, total })
+			base := done
+			err := r.Upload(ctx, fileOpener(p.lib.Path(it)), it.File, it.SHA256, func(n, _ int64) {
+				p.act.Set(t, func(t *Task) { t.Done = base + n })
+			})
+			if err == nil && it.Image != "" {
+				sum, _ := fileSHA256(p.lib.ImagePath(it))
+				err = r.Upload(ctx, fileOpener(p.lib.ImagePath(it)), it.RemoteImage(), sum, func(int64, int64) {})
+			}
+			if err != nil {
+				fail(fmt.Errorf("%s: %w", it.Name, err))
+				return
+			}
+			p.lib.MarkUploaded(it.Kind, it.ID, it.SHA256)
+			done += it.Size
+		}
+		// Build again: the library may have changed while uploading.
+		payload, err := BuildEvent(d, p.lib)
+		if err != nil {
+			fail(err)
+			return
+		}
+		var res struct {
+			Event Event `json:"event"`
+		}
+		p.act.Set(t, func(t *Task) { t.Detail = "Salvando o evento" })
+		if err := r.Call(ctx, "event-save", payload, &res); err != nil {
+			fail(err)
+			return
+		}
+		p.mu.Lock()
+		p.lastError = ""
+		p.mu.Unlock()
+		p.act.mu.Lock()
+		p.act.PublishedAt = time.Now()
+		p.act.mu.Unlock()
+		p.act.Set(t, func(t *Task) { t.State, t.Done, t.Detail = "done", t.Total, res.Event.ID })
 	})
+	return t, nil
 }
 
 func (p *Publisher) LastError() string {

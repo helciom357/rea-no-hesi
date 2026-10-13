@@ -55,6 +55,12 @@ const ICONS = {
   x: '<path d="M6 6l12 12M18 6 6 18"/>',
   copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>',
+  lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+  lan: '<rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M6 16v-4h12v4"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
 };
 function icon(name) {
   const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -131,5 +137,9 @@ const STATE = {
   ok: { label: 'Instalado', cls: 'ok' },
   missing: { label: 'Falta baixar', cls: 'bad' },
   broken: { label: 'Danificado', cls: 'bad' },
-  outdated: { label: 'Atualizar', cls: 'warn' },
+  outdated: { label: 'Versão diferente', cls: 'warn' },
 };
+
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => toast('Copiado.'), () => toast('Não consegui copiar.', true));
+}

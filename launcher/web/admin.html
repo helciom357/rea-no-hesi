@@ -4,22 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="token" content="{{TOKEN}}">
-<title>Painel da base · Launcher Brasil</title>
+<title>Painel do host · Launcher Brasil</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 <div class="shell">
-  <nav class="rail" aria-label="Menu do administrador">
+  <nav class="rail" aria-label="Menu do host">
     <div class="logo" title="Launcher Brasil {{VERSION}}"><i></i></div>
-    <a href="#/conteudo" data-nav="conteudo"></a>
-    <a href="#/salas" data-nav="salas"></a>
-    <a href="#/conexao" data-nav="conexao"></a>
+    <a href="#/eventos" data-nav="eventos"></a>
+    <a href="#/base" data-nav="base"></a>
     <div class="grow"></div>
     <a href="/" data-nav="jogador"></a>
   </nav>
   <main class="main" id="main"></main>
 </div>
-<div class="drop-overlay" id="overlay">Solte os .zip para adicionar à base</div>
+<div class="drop-overlay" id="overlay">Solte os .zip da pista e dos carros</div>
 <input type="file" id="filePick" accept=".zip" multiple hidden>
 <dialog id="dlg"></dialog>
 <script src="/static/common.js"></script>

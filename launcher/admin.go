@@ -2,12 +2,12 @@ package main
 
 import (
 	"archive/zip"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,79 +16,138 @@ import (
 	"time"
 )
 
-// AdminBase is what the admin edits: rooms that point at library items by id.
-// It is turned into the published Hub (with versions, links and hashes) by
-// BuildHub.
-type AdminBase struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description,omitempty"`
-	Rooms       []AdminRoom `json:"rooms"`
-}
-
-type AdminRoom struct {
+// EventDraft is what the host fills in the panel. Track and cars point at
+// library items by folder id; BuildEvent turns it into the published Event
+// with the exact package (hash, size, file checks) of each one.
+type EventDraft struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
-	Mode        string   `json:"mode"` // free text: "Tráfego pesado", "Racha"…
-	Description string   `json:"description,omitempty"`
-	Host        string   `json:"host"`
-	HTTPPort    int      `json:"httpPort"`
+	Description string   `json:"description"`
+	Private     bool     `json:"private"`
+	Password    string   `json:"password,omitempty"` // empty keeps the current one
+	HasPassword bool     `json:"hasPassword,omitempty"`
+	LAN         bool     `json:"lan"`
+	RadminNet   string   `json:"radminNetwork"`
+	RadminPass  string   `json:"radminPassword"`
+	Invite      string   `json:"invite"`
 	Track       string   `json:"track"`
-	Layout      string   `json:"layout,omitempty"`
+	Layout      string   `json:"layout"`
 	Cars        []string `json:"cars"`
 }
 
-func LoadAdminBase(p string) (*AdminBase, error) {
-	b, err := os.ReadFile(p)
-	if errors.Is(err, fs.ErrNotExist) {
-		return &AdminBase{Name: "Minha base", Rooms: []AdminRoom{}}, nil
+// DraftFromEvent opens a published event for editing.
+func DraftFromEvent(e Event, hasPassword bool) EventDraft {
+	d := EventDraft{ID: e.ID, Name: e.Name, Description: e.Description, Private: e.Private, HasPassword: hasPassword,
+		LAN: e.LAN, Invite: e.Invite, Track: e.Track.ID, Layout: e.Track.Layout, Cars: []string{}}
+	if e.Radmin != nil {
+		d.RadminNet, d.RadminPass = e.Radmin.Network, e.Radmin.Password
 	}
-	if err != nil {
-		return nil, err
+	for _, c := range e.Cars {
+		d.Cars = append(d.Cars, c.ID)
 	}
-	var a AdminBase
-	if err := json.Unmarshal(b, &a); err != nil {
-		return nil, fmt.Errorf("base.json inválido: %w", err)
-	}
-	if a.Rooms == nil {
-		a.Rooms = []AdminRoom{}
-	}
-	return &a, nil
+	return d
 }
 
-func SaveAdminBase(p string, a *AdminBase) error {
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
+// Problems lists what still keeps the event from being published, in the
+// order of the form.
+func (d EventDraft) Problems(lib *Library) []string {
+	var p []string
+	if strings.TrimSpace(d.Name) == "" {
+		p = append(p, "dê um nome ao evento")
 	}
-	a.normalize()
-	b, _ := json.MarshalIndent(a, "", "  ")
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
+	if d.Private && d.Password == "" && !d.HasPassword {
+		p = append(p, "defina a senha do evento privado")
 	}
-	return os.Rename(tmp, p)
+	if d.LAN && strings.TrimSpace(d.RadminNet) == "" {
+		p = append(p, "informe o nome da rede Radmin")
+	}
+	if _, err := ParseInvite(d.Invite); err != nil {
+		p = append(p, err.Error())
+	}
+	if d.Track == "" {
+		p = append(p, "escolha a pista")
+	} else if _, ok := lib.Get("track", d.Track); !ok {
+		p = append(p, "envie a pista "+d.Track)
+	}
+	if len(d.Cars) == 0 {
+		p = append(p, "adicione ao menos um carro")
+	}
+	var missing []string
+	for _, c := range d.Cars {
+		if _, ok := lib.Get("car", c); !ok {
+			missing = append(missing, c)
+		}
+	}
+	if len(missing) == 1 {
+		p = append(p, "envie o carro "+missing[0])
+	} else if len(missing) > 1 {
+		p = append(p, fmt.Sprintf("envie %d carros que faltam", len(missing)))
+	}
+	return p
 }
 
-// normalize gives every room a stable, unique id derived from its name.
-func (a *AdminBase) normalize() {
-	taken := map[string]bool{}
-	for i := range a.Rooms {
-		r := &a.Rooms[i]
-		r.Name = strings.TrimSpace(r.Name)
-		r.Mode = strings.TrimSpace(r.Mode)
-		r.Host = strings.TrimSpace(r.Host)
-		if r.Cars == nil {
-			r.Cars = []string{}
-		}
-		if r.ID == "" || !ValidID(r.ID) || taken[r.ID] {
-			base := Slug(r.Name)
-			id := base
-			for n := 2; taken[id]; n++ {
-				id = fmt.Sprintf("%s-%d", base, n)
-			}
-			r.ID = id
-		}
-		taken[r.ID] = true
+// Items lists the library items the event uses.
+func (d EventDraft) Items(lib *Library) []LibItem {
+	var out []LibItem
+	if it, ok := lib.Get("track", d.Track); ok {
+		out = append(out, it)
 	}
+	seen := map[string]bool{}
+	for _, c := range d.Cars {
+		if it, ok := lib.Get("car", c); ok && !seen[c] {
+			seen[c] = true
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+func entryFor(it LibItem) ContentEntry {
+	img := ""
+	if it.Image != "" {
+		img = it.RemoteImage()
+	}
+	return ContentEntry{ID: it.ID, Name: it.Name, Version: it.Version, File: it.File, SHA256: it.SHA256,
+		Size: it.Size, Image: img, Checks: it.Checks}
+}
+
+// eventPayload is what upload.php?action=event-save receives.
+type eventPayload struct {
+	Event
+	Password string `json:"password,omitempty"`
+}
+
+func BuildEvent(d EventDraft, lib *Library) (eventPayload, error) {
+	if p := d.Problems(lib); len(p) > 0 {
+		return eventPayload{}, errors.New(p[0])
+	}
+	in, _ := ParseInvite(d.Invite)
+	ev := Event{ID: d.ID, Name: strings.TrimSpace(d.Name), Description: strings.TrimSpace(d.Description),
+		Private: d.Private, LAN: d.LAN, Invite: strings.TrimSpace(d.Invite),
+		Server: ServerAddr{Host: in.Host, HTTPPort: in.HTTPPort}, Cars: []ContentEntry{}}
+	if ev.ID == "" {
+		ev.ID = Slug(d.Name) + "-" + NewKey()[:6]
+	}
+	if d.LAN {
+		ev.Radmin = &Radmin{Network: strings.TrimSpace(d.RadminNet), Password: strings.TrimSpace(d.RadminPass)}
+	}
+	track, _ := lib.Get("track", d.Track)
+	ev.Track = entryFor(track)
+	ev.Track.Layout = d.Layout
+	seen := map[string]bool{}
+	for _, c := range d.Cars {
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		it, _ := lib.Get("car", c)
+		ev.Cars = append(ev.Cars, entryFor(it))
+	}
+	pw := ""
+	if d.Private {
+		pw = d.Password
+	}
+	return eventPayload{Event: ev, Password: pw}, nil
 }
 
 var (
@@ -102,122 +161,42 @@ var (
 func Slug(s string) string {
 	t := accents.Replace(strings.ToLower(s))
 	t = strings.Trim(nonSlug.ReplaceAllString(t, "-"), "-")
-	if len(t) > 60 {
-		t = strings.Trim(t[:60], "-")
+	if len(t) > 50 {
+		t = strings.Trim(t[:50], "-")
 	}
 	if t == "" {
-		t = "sala"
+		t = "evento"
 	}
 	return t
 }
 
-// RoomProblems explains why a room cannot be published yet.
-func RoomProblems(r AdminRoom, lib *Library) []string {
-	var p []string
-	if r.Name == "" {
-		p = append(p, "dê um nome à sala")
-	}
-	if r.Mode == "" {
-		p = append(p, "escolha o modo de jogo")
-	}
-	if r.Host == "" || r.HTTPPort == 0 {
-		p = append(p, "informe o endereço do servidor (IP:porta HTTP)")
-	}
-	if r.Track == "" {
-		p = append(p, "escolha a pista")
-	} else if it, ok := lib.Get("track", r.Track); !ok {
-		p = append(p, "a pista "+r.Track+" não está mais no conteúdo")
-	} else if len(it.Layouts) > 1 && r.Layout == "" {
-		p = append(p, "escolha o traçado da pista")
-	}
-	if len(r.Cars) == 0 {
-		p = append(p, "adicione ao menos um carro")
-	}
-	for _, c := range r.Cars {
-		if _, ok := lib.Get("car", c); !ok {
-			p = append(p, "o carro "+c+" não está mais no conteúdo")
-		}
-	}
-	return p
+// ---- host codes ---------------------------------------------------------------
+
+// A host code is what the owner sends to someone who will create events:
+// the base address and that host's own key, in one string to paste.
+const hostCodePrefix = "LB1-"
+
+type hostCode struct {
+	URL string `json:"u"`
+	Key string `json:"k"`
 }
 
-// BuildHub turns the admin base into the published hub. Rooms with problems
-// are left out so players never see a room they cannot join.
-func BuildHub(a *AdminBase, lib *Library, filesURL string) *Hub {
-	h := &Hub{Name: a.Name, Description: a.Description, DownloadBase: strings.TrimRight(filesURL, "/"),
-		AllowedHosts: []string{}, Modes: []Mode{}, Rooms: []Room{}}
-	if u, err := url.Parse(filesURL); err == nil && u.Hostname() != "" {
-		h.AllowedHosts = []string{u.Hostname()}
-	}
-	image := func(it LibItem) string {
-		if it.Image == "" || h.DownloadBase == "" {
-			return ""
-		}
-		return h.DownloadBase + "/" + url.PathEscape(it.RemoteImage())
-	}
-	entry := func(it LibItem) ContentEntry {
-		return ContentEntry{ID: it.ID, Name: it.Name, Version: it.Version, File: it.File,
-			SHA256: it.SHA256, Size: it.Size, Image: image(it)}
-	}
-	modes := map[string]bool{}
-	for _, r := range a.Rooms {
-		if len(RoomProblems(r, lib)) > 0 {
-			continue
-		}
-		modeID := Slug(r.Mode)
-		if !modes[modeID] {
-			modes[modeID] = true
-			h.Modes = append(h.Modes, Mode{ID: modeID, Name: r.Mode})
-		}
-		track, _ := lib.Get("track", r.Track)
-		te := entry(track)
-		te.Layout = r.Layout
-		room := Room{ID: r.ID, Name: r.Name, ModeID: modeID, Description: r.Description,
-			Server: ServerAddr{Host: r.Host, HTTPPort: r.HTTPPort}, Track: te, Image: te.Image}
-		seen := map[string]bool{}
-		for _, c := range r.Cars {
-			if seen[c] {
-				continue
-			}
-			seen[c] = true
-			it, _ := lib.Get("car", c)
-			room.Cars = append(room.Cars, entry(it))
-		}
-		h.Rooms = append(h.Rooms, room)
-	}
-	return h
+func EncodeHostCode(endpoint, key string) string {
+	b, _ := json.Marshal(hostCode{URL: endpoint, Key: key})
+	return hostCodePrefix + base64.RawURLEncoding.EncodeToString(b)
 }
 
-// ReferencedItems lists the library items used by publishable rooms.
-func ReferencedItems(a *AdminBase, lib *Library) []LibItem {
-	var out []LibItem
-	seen := map[string]bool{}
-	add := func(kind, id string) {
-		if it, ok := lib.Get(kind, id); ok && !seen[it.Key()] {
-			seen[it.Key()] = true
-			out = append(out, it)
-		}
+func DecodeHostCode(code string) (endpoint, key string, err error) {
+	code = strings.Join(strings.Fields(code), "")
+	if !strings.HasPrefix(code, hostCodePrefix) {
+		return "", "", errors.New("isso não parece um código de host (começa com LB1-)")
 	}
-	for _, r := range a.Rooms {
-		if len(RoomProblems(r, lib)) > 0 {
-			continue
-		}
-		add("track", r.Track)
-		for _, c := range r.Cars {
-			add("car", c)
-		}
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(code, hostCodePrefix))
+	var c hostCode
+	if err != nil || json.Unmarshal(b, &c) != nil || c.URL == "" || c.Key == "" {
+		return "", "", errors.New("código de host incompleto — copie de novo")
 	}
-	return out
-}
-
-// CMContentJSON is the cfg/cm_content/content.json for one room's
-// AssettoServer, so Content Manager users get the same download links.
-func CMContentJSON(h *Hub, roomID string) ([]byte, error) {
-	r := h.Room(roomID)
-	if r == nil {
-		return nil, errors.New("a sala ainda não está completa")
-	}
-	return json.MarshalIndent(h.CMContentFor(*r), "", "  ")
+	return c.URL, c.Key, nil
 }
 
 // ---- content already installed on the admin's PC -----------------------------

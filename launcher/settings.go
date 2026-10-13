@@ -16,11 +16,18 @@ import (
 type Settings struct {
 	ACPath    string `json:"acPath"`
 	HubSource string `json:"hubSource"` // URL or local path of hub.json
-	// Admin side.
-	AdminBase  string `json:"adminBase"`  // path of the admin's base.json
-	LibraryDir string `json:"libraryDir"` // packages added to the base
+	// Passwords of private events this player unlocked, by event id.
+	EventPasswords map[string]string `json:"eventPasswords,omitempty"`
+	// Host side.
+	LibraryDir string `json:"libraryDir"` // packages prepared on this PC
 	UploadURL  string `json:"uploadUrl"`  // https://site/ac/upload.php
 	UploadKey  string `json:"uploadKey"`
+	Role       string `json:"role,omitempty"` // owner or host, as the base answered
+	HostName   string `json:"hostName,omitempty"`
+	BaseName   string `json:"baseName,omitempty"`
+	// OwnerKey is generated for the upload.php the owner downloads; it only
+	// becomes UploadKey once that upload.php answers.
+	OwnerKey string `json:"ownerKey,omitempty"`
 }
 
 var settingsMu sync.Mutex
@@ -60,9 +67,6 @@ func LoadSettings() Settings {
 		if p := filepath.Join(exeDir(), "hub.json"); exists(p) {
 			s.HubSource = p
 		}
-	}
-	if s.AdminBase == "" {
-		s.AdminBase = filepath.Join(appDir(), "base.json")
 	}
 	if s.LibraryDir == "" {
 		s.LibraryDir = filepath.Join(appDir(), "conteudo")

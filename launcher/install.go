@@ -172,16 +172,10 @@ func checkAllowedURL(h *Hub, raw string) error {
 	if local {
 		return nil
 	}
-	for _, a := range h.AllowedHosts {
-		a = strings.ToLower(strings.TrimSpace(a))
-		if a == "" {
-			continue
-		}
-		if strings.EqualFold(host, a) || (strings.HasPrefix(a, "*.") && strings.HasSuffix(strings.ToLower(host), a[1:])) {
-			return nil
-		}
+	if a := h.AllowedHost(); a != "" && strings.EqualFold(host, a) {
+		return nil
 	}
-	return fmt.Errorf("o host %s não está na lista de hosts permitidos da base", host)
+	return fmt.Errorf("o download não vem do site da base (%s)", host)
 }
 
 var downloadClient = &http.Client{Timeout: 0}

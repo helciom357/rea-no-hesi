@@ -64,16 +64,17 @@ func (r *Remote) FilesURL() string {
 	return u.String()
 }
 
+// HubURL is the link players paste: the public event list of the base.
 func (r *Remote) HubURL() string {
-	if f := r.FilesURL(); f != "" {
-		return f + "/hub.json"
+	if r.Endpoint == "" {
+		return ""
 	}
-	return ""
+	return NormalizeHubLink(r.Endpoint)
 }
 
 func (r *Remote) do(ctx context.Context, method, action string, q url.Values, body io.Reader, out any) error {
 	if r.Endpoint == "" {
-		return errors.New("conexão com o site não configurada")
+		return errors.New("o painel ainda não está ligado a uma base")
 	}
 	u, err := url.Parse(r.Endpoint)
 	if err != nil || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost"))) {
@@ -127,17 +128,56 @@ type remoteErr struct {
 
 func (e *remoteErr) Error() string { return e.msg }
 
-func (r *Remote) Ping(ctx context.Context) error {
-	var v struct {
-		OK bool `json:"ok"`
-	}
+// Identity is who the key belongs to on the base.
+type Identity struct {
+	OK     bool   `json:"ok"`
+	Role   string `json:"role"` // owner or host
+	HostID string `json:"hostId"`
+	Name   string `json:"name"`
+	Base   string `json:"base"`
+}
+
+func (r *Remote) Ping(ctx context.Context) (Identity, error) {
+	var v Identity
 	if err := r.do(ctx, http.MethodGet, "ping", nil, nil, &v); err != nil {
-		return err
+		return v, err
 	}
 	if !v.OK {
-		return errors.New("resposta inesperada do upload.php")
+		return v, errors.New("resposta inesperada do upload.php")
 	}
-	return nil
+	return v, nil
+}
+
+// Call posts a JSON body to one of the base's actions.
+func (r *Remote) Call(ctx context.Context, action string, in, out any) error {
+	var body io.Reader
+	if in != nil {
+		b, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(b)
+	}
+	method := http.MethodPost
+	if in == nil {
+		method = http.MethodGet
+	}
+	return r.do(ctx, method, action, nil, body, out)
+}
+
+// Unlock asks the base for a private event; no key is needed, only the
+// event password.
+func Unlock(ctx context.Context, hubLink, eventID, password string) (*Event, error) {
+	u, err := url.Parse(NormalizeHubLink(hubLink))
+	if err != nil || !strings.HasSuffix(u.Path, ".php") {
+		return nil, errors.New("esta base não aceita eventos privados")
+	}
+	r := NewRemote((&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String(), "")
+	var ev Event
+	if err := r.Call(ctx, "unlock", map[string]string{"event": eventID, "password": password}, &ev); err != nil {
+		return nil, err
+	}
+	return &ev, nil
 }
 
 func (r *Remote) RemoteSize(ctx context.Context, name string) (size, part int64, err error) {

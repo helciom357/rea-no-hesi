@@ -9,77 +9,99 @@ import (
 	"time"
 )
 
-// Item is one car or track a room needs, with its state on this PC.
+// Item is one car or track an event needs, with its state on this PC.
 type Item struct {
-	Kind         string   `json:"kind"` // "car" or "track"
-	ID           string   `json:"id"`
-	Layout       string   `json:"layout,omitempty"`
-	Name         string   `json:"name,omitempty"`
-	State        string   `json:"state"` // ok, missing, broken, outdated
-	LocalVersion string   `json:"localVersion,omitempty"`
-	Version      string   `json:"version,omitempty"`
-	URL          string   `json:"url,omitempty"`
-	SHA256       string   `json:"sha256,omitempty"`
-	Size         int64    `json:"size,omitempty"`
-	Problems     []string `json:"problems,omitempty"`
+	Kind     string   `json:"kind"` // "car" or "track"
+	ID       string   `json:"id"`
+	Layout   string   `json:"layout,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	State    string   `json:"state"` // ok, missing, broken, outdated (files differ from the server's)
+	Version  string   `json:"version,omitempty"`
+	URL      string   `json:"url,omitempty"`
+	Image    string   `json:"image,omitempty"`
+	SHA256   string   `json:"sha256,omitempty"`
+	Size     int64    `json:"size,omitempty"`
+	Problems []string `json:"problems,omitempty"`
 }
 
 func (i Item) Key() string { return i.Kind + ":" + i.ID }
 
-type RoomStatus struct {
-	RoomID    string  `json:"roomId"`
-	Ready     bool    `json:"ready"`
-	Pending   int     `json:"pending"`
-	PendingMB float64 `json:"pendingMB"`
-	Items     []Item  `json:"items"`
+type EventStatus struct {
+	EventID string `json:"eventId"`
+	Ready   bool   `json:"ready"`
+	Pending int    `json:"pending"`
+	Bytes   int64  `json:"bytes"`
+	Items   []Item `json:"items"`
 }
 
-func classify(local LocalState, e ContentEntry) (string, LocalState) {
+// classify compares the installed mod with the one the event pins. When the
+// event carries file checks those decide; the version number is only a
+// fallback for entries without them.
+func classify(acRoot, kind string, e ContentEntry) (string, []string) {
+	var local LocalState
+	dir := carDir(acRoot, e.ID)
+	if kind == "track" {
+		local = CheckTrack(acRoot, e.ID, e.Layout)
+		dir = trackDir(acRoot, e.ID)
+	} else {
+		local = CheckCar(acRoot, e.ID)
+	}
 	switch {
 	case !local.Found:
-		return "missing", local
+		return "missing", nil
 	case !local.Healthy:
-		return "broken", local
-	case NewerVersion(e.Version, local.Version):
-		return "outdated", local
-	default:
-		return "ok", local
+		return "broken", local.Problems
 	}
+	if len(e.Checks) > 0 {
+		if diff := CompareChecks(dir, e.Checks); len(diff) > 0 {
+			return "outdated", diff
+		}
+		return "ok", nil
+	}
+	if NewerVersion(e.Version, local.Version) {
+		return "outdated", nil
+	}
+	return "ok", nil
 }
 
-func StatusForRoom(h *Hub, acRoot string, r Room) RoomStatus {
-	rs := RoomStatus{RoomID: r.ID, Ready: true}
-	add := func(kind string, e ContentEntry, local LocalState) {
-		state, l := classify(local, e)
-		it := Item{Kind: kind, ID: e.ID, Layout: e.Layout, Name: e.Name, State: state,
-			LocalVersion: l.Version, Version: e.Version, URL: h.DownloadURL(e),
-			SHA256: e.SHA256, Size: e.Size, Problems: l.Problems}
+func StatusForEvent(h *Hub, acRoot string, ev Event) EventStatus {
+	st := EventStatus{EventID: ev.ID, Ready: true}
+	add := func(kind string, e ContentEntry) {
+		state, problems := classify(acRoot, kind, e)
+		it := Item{Kind: kind, ID: e.ID, Layout: e.Layout, Name: e.Name, State: state, Version: e.Version,
+			URL: h.DownloadURL(e), Image: h.ImageURL(e), SHA256: e.SHA256, Size: e.Size, Problems: problems}
 		if state != "ok" {
-			rs.Ready = false
-			rs.Pending++
-			rs.PendingMB += float64(e.Size) / (1 << 20)
+			st.Ready = false
+			st.Pending++
+			st.Bytes += e.Size
 		}
-		rs.Items = append(rs.Items, it)
+		st.Items = append(st.Items, it)
 	}
-	add("track", r.Track, CheckTrack(acRoot, r.Track.ID, r.Track.Layout))
+	if ValidID(ev.Track.ID) {
+		add("track", ev.Track)
+	}
 	seen := map[string]bool{}
-	for _, c := range r.Cars {
-		if seen[c.ID] {
+	for _, c := range ev.Cars {
+		if seen[c.ID] || !ValidID(c.ID) {
 			continue
 		}
 		seen[c.ID] = true
-		add("car", c, CheckCar(acRoot, c.ID))
+		add("car", c)
 	}
-	return rs
+	return st
 }
 
-// PendingForRooms merges the missing items of several rooms, so a whole mode
-// can be installed at once without downloading shared content twice.
-func PendingForRooms(h *Hub, acRoot string, rooms []Room) []Item {
+// PendingForEvents merges what several events need, so shared content is
+// downloaded once. When two events pin different files for the same mod,
+// the first event wins; the other one will show it as different afterwards.
+func PendingForEvents(h *Hub, acRoot string, events []Event) []Item {
 	var out []Item
 	seen := map[string]bool{}
-	for _, r := range rooms {
-		for _, it := range StatusForRoom(h, acRoot, r).Items {
+	for _, ev := range events {
+		if ev.Locked {
+			continue
+		}
+		for _, it := range StatusForEvent(h, acRoot, ev).Items {
 			if it.State == "ok" || seen[it.Key()] {
 				continue
 			}
@@ -150,19 +172,22 @@ func FetchLive(s ServerAddr) LiveInfo {
 	return li
 }
 
-func FetchLiveAll(rooms []Room) map[string]LiveInfo {
+func FetchLiveAll(events []Event) map[string]LiveInfo {
 	out := map[string]LiveInfo{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, r := range rooms {
+	for _, ev := range events {
+		if ev.Locked {
+			continue
+		}
 		wg.Add(1)
-		go func(r Room) {
+		go func(ev Event) {
 			defer wg.Done()
-			li := FetchLive(r.Server)
+			li := FetchLive(ev.Server)
 			mu.Lock()
-			out[r.ID] = li
+			out[ev.ID] = li
 			mu.Unlock()
-		}(r)
+		}(ev)
 	}
 	wg.Wait()
 	return out

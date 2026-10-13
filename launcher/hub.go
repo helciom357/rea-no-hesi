@@ -8,59 +8,63 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 	"time"
 )
 
-// Hub is the published description of the whole base: game modes, rooms and
-// the exact content (with version and download link) each room requires.
-// The admin panel edits it as base.json and exports it as hub.json.
+// Hub is what upload.php?action=hub publishes: the base and every event
+// (race invite) its hosts created. Private events come locked: no invite,
+// no network data and no download links until the player gives the password.
 type Hub struct {
-	Name         string   `json:"name"`
-	Description  string   `json:"description,omitempty"`
-	DownloadBase string   `json:"downloadBase,omitempty"` // URL prefix used for packages without an explicit URL
-	AllowedHosts []string `json:"allowedHosts"`           // hosts the launcher is allowed to download from
-	Modes        []Mode   `json:"modes"`
-	Rooms        []Room   `json:"rooms"`
+	Name        string  `json:"name"`
+	Description string  `json:"description,omitempty"`
+	FilesURL    string  `json:"filesUrl,omitempty"` // public folder with the packages
+	Events      []Event `json:"events"`
 }
 
-type Mode struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-}
-
-type Room struct {
+type Event struct {
 	ID          string         `json:"id"`
+	Host        string         `json:"host,omitempty"` // host display name
+	HostID      string         `json:"hostId,omitempty"`
 	Name        string         `json:"name"`
-	ModeID      string         `json:"modeId"`
 	Description string         `json:"description,omitempty"`
+	Private     bool           `json:"private,omitempty"`
+	Locked      bool           `json:"locked,omitempty"` // private and not unlocked yet
+	LAN         bool           `json:"lan,omitempty"`
+	Radmin      *Radmin        `json:"radmin,omitempty"`
+	Invite      string         `json:"invite,omitempty"`
 	Server      ServerAddr     `json:"server"`
 	Track       ContentEntry   `json:"track"`
 	Cars        []ContentEntry `json:"cars"`
-	Image       string         `json:"image,omitempty"`
+	UpdatedAt   string         `json:"updatedAt,omitempty"`
+}
+
+// Radmin is the virtual LAN players join before connecting to a LAN event.
+type Radmin struct {
+	Network  string `json:"network"`
+	Password string `json:"password"`
 }
 
 type ServerAddr struct {
-	Host     string `json:"host"`
-	TCPPort  int    `json:"tcpPort,omitempty"`
-	HTTPPort int    `json:"httpPort"`
-	Password bool   `json:"password,omitempty"`
+	Host     string `json:"host,omitempty"`
+	HTTPPort int    `json:"httpPort,omitempty"`
 }
 
-// ContentEntry is one car or track. ID is the folder name under content/cars
-// or content/tracks. Layout is only used for tracks with several layouts.
+// ContentEntry is one car or track of an event. ID is the folder name under
+// content/cars or content/tracks; File is the package on the base, named by
+// its hash so two hosts never overwrite each other's version.
 type ContentEntry struct {
-	ID      string `json:"id"`
-	Layout  string `json:"layout,omitempty"`
-	Name    string `json:"name,omitempty"`
-	Version string `json:"version,omitempty"`
-	URL     string `json:"url,omitempty"`
-	File    string `json:"file,omitempty"` // package file name, combined with DownloadBase when URL is empty
-	SHA256  string `json:"sha256,omitempty"`
-	Size    int64  `json:"size,omitempty"`
-	Image   string `json:"image,omitempty"`
+	ID      string      `json:"id"`
+	Layout  string      `json:"layout,omitempty"`
+	Name    string      `json:"name,omitempty"`
+	Version string      `json:"version,omitempty"`
+	File    string      `json:"file,omitempty"`
+	SHA256  string      `json:"sha256,omitempty"`
+	Size    int64       `json:"size,omitempty"`
+	Image   string      `json:"image,omitempty"` // file name on the base
+	Checks  []FileCheck `json:"checks,omitempty"`
 }
 
 var safeID = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}$`)
@@ -71,142 +75,114 @@ func ValidID(s string) bool {
 	return safeID.MatchString(s) && !strings.Contains(s, "..")
 }
 
-// DownloadURL returns the URL a package is fetched from.
-func (h *Hub) DownloadURL(e ContentEntry) string {
-	if e.URL != "" {
-		return e.URL
+func (h *Hub) fileURL(name string) string {
+	if name == "" || h.FilesURL == "" {
+		return ""
 	}
-	if e.File != "" && h.DownloadBase != "" {
-		return strings.TrimRight(h.DownloadBase, "/") + "/" + url.PathEscape(e.File)
-	}
-	return ""
+	return strings.TrimRight(h.FilesURL, "/") + "/" + url.PathEscape(name)
 }
 
-func (h *Hub) Mode(id string) *Mode {
-	for i := range h.Modes {
-		if h.Modes[i].ID == id {
-			return &h.Modes[i]
+// DownloadURL returns where a package is fetched from.
+func (h *Hub) DownloadURL(e ContentEntry) string { return h.fileURL(e.File) }
+
+// ImageURL returns the preview picture of an entry.
+func (h *Hub) ImageURL(e ContentEntry) string { return h.fileURL(e.Image) }
+
+func (h *Hub) Event(id string) *Event {
+	for i := range h.Events {
+		if h.Events[i].ID == id {
+			return &h.Events[i]
 		}
 	}
 	return nil
 }
 
-func (h *Hub) Room(id string) *Room {
-	for i := range h.Rooms {
-		if h.Rooms[i].ID == id {
-			return &h.Rooms[i]
-		}
-	}
-	return nil
-}
-
-// Validate returns every problem found, so the admin can fix them in one pass.
-func (h *Hub) Validate() []string {
-	p := []string{}
-	if strings.TrimSpace(h.Name) == "" {
-		p = append(p, "A base precisa de um nome.")
-	}
-	modes := map[string]bool{}
-	for _, m := range h.Modes {
-		if !ValidID(m.ID) {
-			p = append(p, fmt.Sprintf("Modo %q: id inválido (use letras, números, _ - .).", m.Name))
-		}
-		if modes[m.ID] {
-			p = append(p, fmt.Sprintf("Modo %q repetido.", m.ID))
-		}
-		modes[m.ID] = true
-	}
-	rooms := map[string]bool{}
-	for _, r := range h.Rooms {
-		label := r.Name
-		if label == "" {
-			label = r.ID
-		}
-		if !ValidID(r.ID) {
-			p = append(p, fmt.Sprintf("Sala %q: id inválido.", label))
-		}
-		if rooms[r.ID] {
-			p = append(p, fmt.Sprintf("Sala %q repetida.", r.ID))
-		}
-		rooms[r.ID] = true
-		if !modes[r.ModeID] {
-			p = append(p, fmt.Sprintf("Sala %q: modo %q não existe.", label, r.ModeID))
-		}
-		if r.Server.Host == "" || r.Server.HTTPPort == 0 {
-			p = append(p, fmt.Sprintf("Sala %q: falta o endereço ou a porta HTTP do servidor.", label))
-		}
-		if !ValidID(r.Track.ID) {
-			p = append(p, fmt.Sprintf("Sala %q: pista sem id válido.", label))
-		} else if r.Track.Layout != "" && !ValidID(r.Track.Layout) {
-			p = append(p, fmt.Sprintf("Sala %q: layout da pista inválido.", label))
-		}
-		if len(r.Cars) == 0 {
-			p = append(p, fmt.Sprintf("Sala %q: nenhum carro.", label))
-		}
-		entries := append([]ContentEntry{r.Track}, r.Cars...)
-		for i, e := range entries {
-			kind := "Carro"
-			if i == 0 {
-				kind = "Pista"
-			}
-			if i > 0 && !ValidID(e.ID) {
-				p = append(p, fmt.Sprintf("Sala %q: carro com id inválido %q.", label, e.ID))
-			}
-			if e.Version == "" {
-				p = append(p, fmt.Sprintf("Sala %q: %s %q sem versão — sem versão o launcher não detecta atualização.", label, strings.ToLower(kind), e.ID))
-			}
-			if h.DownloadURL(e) == "" {
-				p = append(p, fmt.Sprintf("Sala %q: %s %q sem link de download.", label, strings.ToLower(kind), e.ID))
-			}
-		}
-	}
-	return p
-}
-
-func LoadHubFile(path string) (*Hub, error) {
-	b, err := os.ReadFile(path)
+// AllowedHost is the only host packages may come from: the base's own site.
+func (h *Hub) AllowedHost() string {
+	u, err := url.Parse(h.FilesURL)
 	if err != nil {
-		return nil, err
+		return ""
 	}
-	return ParseHub(b)
+	return u.Hostname()
 }
 
 func ParseHub(b []byte) (*Hub, error) {
 	var h Hub
 	if err := json.Unmarshal(b, &h); err != nil {
-		return nil, fmt.Errorf("hub inválido: %w", err)
+		return nil, fmt.Errorf("a base respondeu algo inválido: %w", err)
+	}
+	if h.Events == nil {
+		h.Events = []Event{}
 	}
 	return &h, nil
 }
 
-// LoadHub reads the hub from a local path or an http(s) URL.
+var hubClient = &http.Client{Timeout: 20 * time.Second}
+
+// LoadHub reads the hub from the base link (upload.php?action=hub or a
+// hub.json URL) or from a local file.
 func LoadHub(src string) (*Hub, error) {
 	src = strings.TrimSpace(src)
 	if src == "" {
 		return nil, errors.New("nenhuma base configurada")
 	}
-	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
-		c := &http.Client{Timeout: 20 * time.Second}
-		sep := "?"
-		if strings.Contains(src, "?") {
-			sep = "&"
-		}
-		// Hosting caches often hold .json files; always ask for the latest.
-		resp, err := c.Get(src + sep + "t=" + fmt.Sprint(time.Now().Unix()))
-		if err != nil {
-			return nil, fmt.Errorf("não foi possível baixar a base: %w", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("a base respondeu HTTP %d", resp.StatusCode)
-		}
-		b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
+		b, err := os.ReadFile(src)
 		if err != nil {
 			return nil, err
 		}
 		return ParseHub(b)
 	}
-	return LoadHubFile(src)
+	src = NormalizeHubLink(src)
+	resp, err := hubClient.Get(src)
+	if err != nil {
+		return nil, fmt.Errorf("não foi possível acessar a base: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("a base respondeu HTTP %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, err
+	}
+	h, err := ParseHub(b)
+	if err != nil {
+		return nil, err
+	}
+	// The packages live in files/ next to upload.php; trust the link the
+	// player configured over what the response says.
+	if f := FilesURLFor(src); f != "" {
+		h.FilesURL = f
+	}
+	return h, nil
+}
+
+// NormalizeHubLink accepts the link the way people paste it: the upload.php
+// address, with or without ?action=hub.
+func NormalizeHubLink(src string) string {
+	u, err := url.Parse(strings.TrimSpace(src))
+	if err != nil {
+		return src
+	}
+	if strings.HasSuffix(u.Path, ".php") {
+		q := u.Query()
+		q.Set("action", "hub")
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
+// FilesURLFor derives https://site/ac/files from https://site/ac/upload.php.
+func FilesURLFor(endpoint string) string {
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || u.Host == "" || !strings.HasSuffix(u.Path, ".php") {
+		return ""
+	}
+	u.Path = path.Join(path.Dir(u.Path), "files")
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 // CMContent is the cm_content/content.json format read by AssettoServer and
@@ -221,11 +197,11 @@ type CMEntry struct {
 	Version string `json:"version,omitempty"`
 }
 
-func (h *Hub) CMContentFor(r Room) CMContent {
+func (h *Hub) CMContentFor(e Event) CMContent {
 	c := CMContent{Cars: map[string]CMEntry{}}
-	for _, car := range r.Cars {
+	for _, car := range e.Cars {
 		c.Cars[car.ID] = CMEntry{URL: h.DownloadURL(car), Version: car.Version}
 	}
-	c.Track = &CMEntry{URL: h.DownloadURL(r.Track), Version: r.Track.Version}
+	c.Track = &CMEntry{URL: h.DownloadURL(e.Track), Version: e.Track.Version}
 	return c
 }

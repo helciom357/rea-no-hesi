@@ -182,9 +182,9 @@ func TestInstallArchiveReplacesAndRejectsTraversal(t *testing.T) {
 }
 
 func TestAllowedURL(t *testing.T) {
-	h := &Hub{AllowedHosts: []string{"dl.exemplo.com.br", "*.cdn.com"}}
-	ok := []string{"https://dl.exemplo.com.br/a.zip", "https://x.cdn.com/a.zip", "http://127.0.0.1:9000/a.zip"}
-	bad := []string{"http://dl.exemplo.com.br/a.zip", "https://evil.com/a.zip", "", "ftp://dl.exemplo.com.br/a"}
+	h := &Hub{FilesURL: "https://dl.exemplo.com.br/ac/files"}
+	ok := []string{"https://dl.exemplo.com.br/ac/files/a.zip", "http://127.0.0.1:9000/a.zip"}
+	bad := []string{"http://dl.exemplo.com.br/a.zip", "https://evil.com/a.zip", "https://x.dl.exemplo.com.br/a.zip", "", "ftp://dl.exemplo.com.br/a"}
 	for _, u := range ok {
 		if err := checkAllowedURL(h, u); err != nil {
 			t.Errorf("%s rejected: %v", u, err)

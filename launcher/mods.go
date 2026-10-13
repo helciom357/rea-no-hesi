@@ -20,9 +20,9 @@ type ModEntry struct {
 	Size      int64    `json:"size"`
 	Version   string   `json:"version,omitempty"`
 	Required  bool     `json:"required"`
-	State     string   `json:"state,omitempty"` // ok, missing, broken, outdated (only when required)
-	Rooms     []string `json:"rooms,omitempty"` // rooms that need it
-	Image     string   `json:"image,omitempty"` // remote image from the base
+	State     string   `json:"state,omitempty"`  // ok, missing, broken, outdated (only when required)
+	Events    []string `json:"events,omitempty"` // events that need it
+	Image     string   `json:"image,omitempty"`  // remote image from the base
 	HasLocal  bool     `json:"hasLocalImage"`
 	Problems  []string `json:"problems,omitempty"`
 }
@@ -133,26 +133,31 @@ func ListMods(acRoot string, h *Hub) []ModEntry {
 		}(e)
 	}
 	wg.Wait()
-	// Everything the base needs, with its state on this PC.
+	// Everything the open events need, with its state on this PC.
 	if h != nil {
-		for _, r := range h.Rooms {
-			st := StatusForRoom(h, acRoot, r)
-			for _, it := range st.Items {
+		for _, ev := range h.Events {
+			if ev.Locked {
+				continue
+			}
+			for _, it := range StatusForEvent(h, acRoot, ev).Items {
 				e := get(it.Kind, it.ID)
+				// A mod two events pin differently stays flagged if either differs.
+				if !e.Required || e.State == "ok" {
+					e.State = it.State
+					e.Problems = it.Problems
+				}
 				e.Required = true
-				e.State = it.State
-				e.Problems = it.Problems
 				if it.Name != "" {
 					e.Name = it.Name
 				}
 				if e.Image == "" {
-					e.Image = imageFor(r, it)
+					e.Image = it.Image
 				}
 				if !e.Installed {
 					e.Size = it.Size
 				}
-				if !contains(e.Rooms, r.Name) {
-					e.Rooms = append(e.Rooms, r.Name)
+				if !contains(e.Events, ev.Name) {
+					e.Events = append(e.Events, ev.Name)
 				}
 			}
 		}
@@ -179,18 +184,6 @@ func ListMods(acRoot string, h *Hub) []ModEntry {
 		return strings.ToLower(out[a].Name) < strings.ToLower(out[b].Name)
 	})
 	return out
-}
-
-func imageFor(r Room, it Item) string {
-	if it.Kind == "track" {
-		return r.Track.Image
-	}
-	for _, c := range r.Cars {
-		if c.ID == it.ID {
-			return c.Image
-		}
-	}
-	return ""
 }
 
 func contains(s []string, v string) bool {

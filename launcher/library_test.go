@@ -1,7 +1,6 @@
 package main
 
 import (
-	"archive/zip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -138,50 +138,122 @@ func TestBumpVersionAndSlug(t *testing.T) {
 	}
 }
 
-func baseFixture(t *testing.T) (*AdminBase, *Library) {
+func eventFixture(t *testing.T) (*Library, *Hub) {
 	lib := OpenLibrary(t.TempDir())
 	files := merge(carIn("br_opala/", "Opala SS", ""), carIn("br_fusca/", "Fusca", ""), map[string]string{
-		"br_band/band.kn5": "k", "br_band/models.ini": "m", "br_band/data/surfaces.ini": "s",
-		"br_band/ui/ui_track.json": `{"name": "Bandeirantes"}`, "br_band/ui/preview.png": "PNG",
+		"br_band/band.kn5": "k", "br_band/models_trafego.ini": "m", "br_band/trafego/data/surfaces.ini": "s",
+		"br_band/ui/trafego/ui_track.json": `{"name": "Bandeirantes"}`, "br_band/ui/trafego/preview.png": "PNG",
 	})
 	if _, err := lib.Import(zipOf(t, files)); err != nil {
 		t.Fatal(err)
 	}
-	a := &AdminBase{Name: "Base BR", Rooms: []AdminRoom{
-		{Name: "Bandeirantes", Mode: "Tráfego pesado", Host: "1.2.3.4", HTTPPort: 8081, Track: "br_band", Cars: []string{"br_opala", "br_fusca"}},
-		{Name: "Racha", Mode: "Racha", Host: "1.2.3.4", HTTPPort: 8082, Track: "br_band", Cars: []string{"br_opala"}},
-		{Name: "Incompleta", Mode: "Racha", Track: "br_band"},
-	}}
-	a.normalize()
-	return a, lib
+	d := EventDraft{Name: "Racha de Opala", Invite: "acmanager://race/online/join?ip=1.2.3.4&httpPort=8081",
+		Track: "br_band", Layout: "trafego", Cars: []string{"br_opala", "br_fusca"}}
+	p, err := BuildEvent(d, lib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lib, &Hub{Name: "Base", FilesURL: "https://site.com.br/ac/files", Events: []Event{p.Event}}
 }
 
-func TestBuildHubSkipsIncompleteRooms(t *testing.T) {
-	a, lib := baseFixture(t)
-	h := BuildHub(a, lib, "https://site.com.br/ac/files")
-	if len(h.Rooms) != 2 || len(h.Modes) != 2 || h.Modes[0].ID != "trafego-pesado" {
-		t.Fatalf("hub rooms=%d modes=%+v", len(h.Rooms), h.Modes)
+func TestBuildEventAndProblems(t *testing.T) {
+	lib, h := eventFixture(t)
+	ev := h.Events[0]
+	if !strings.HasPrefix(ev.ID, "racha-de-opala-") || ev.Server.Host != "1.2.3.4" || ev.Server.HTTPPort != 8081 {
+		t.Fatalf("event = %+v", ev)
 	}
-	if p := RoomProblems(a.Rooms[2], lib); len(p) < 2 {
-		t.Fatalf("problems = %v", p)
+	op := ev.Cars[0]
+	if !regexp.MustCompile(`^car-br_opala-[0-9a-f]{12}\.zip$`).MatchString(op.File) || len(op.Checks) == 0 {
+		t.Fatalf("car entry = %+v", op)
 	}
-	r := h.Rooms[0]
-	if r.ID != "bandeirantes" || r.Image != "https://site.com.br/ac/files/img-track-br_band.png" {
-		t.Fatalf("room = %+v", r)
+	if h.DownloadURL(op) != "https://site.com.br/ac/files/"+op.File || h.AllowedHost() != "site.com.br" {
+		t.Fatalf("urls: %s %s", h.DownloadURL(op), h.AllowedHost())
 	}
-	if h.DownloadURL(r.Cars[0]) != "https://site.com.br/ac/files/car-br_opala.zip" || h.AllowedHosts[0] != "site.com.br" {
-		t.Fatalf("urls: %s %v", h.DownloadURL(r.Cars[0]), h.AllowedHosts)
+	bad := EventDraft{Private: true, LAN: true, Invite: "oi", Track: "nao_existe", Cars: []string{"br_opala", "x1", "x2"}}
+	p := strings.Join(bad.Problems(lib), " | ")
+	for _, want := range []string{"nome", "senha", "Radmin", "race invite", "pista nao_existe", "2 carros"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("problems %q missing %q", p, want)
+		}
 	}
-	if len(h.Validate()) != 0 {
-		t.Fatalf("published hub invalid: %v", h.Validate())
-	}
+}
+
+func TestChecksDetectDifferentFiles(t *testing.T) {
+	lib, h := eventFixture(t)
 	ac := t.TempDir()
-	if n := len(PendingForRooms(h, ac, h.Rooms)); n != 3 {
-		t.Fatalf("pending across rooms = %d, want 3 (shared items once)", n)
+	staging := filepath.Join(ac, "content", ".s")
+	os.MkdirAll(staging, 0o755)
+	for _, kind := range []string{"car", "track"} {
+		for _, it := range lib.List() {
+			if it.Kind == kind {
+				if err := InstallArchive(lib.Path(it), ac, staging, kind, it.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
 	}
-	b, err := CMContentJSON(h, "racha")
-	if err != nil || !strings.Contains(string(b), `"br_opala"`) {
-		t.Fatalf("content.json: %s %v", b, err)
+	if st := StatusForEvent(h, ac, h.Events[0]); !st.Ready {
+		t.Fatalf("fresh install not ready: %+v", st.Items)
+	}
+	// Same version number, different physics: the handshake would fail, so
+	// the launcher must flag it.
+	os.WriteFile(filepath.Join(carDir(ac, "br_opala"), "data.acd"), []byte("data-OUTRA"), 0o644)
+	// Changes in skins or ui do not matter.
+	os.WriteFile(filepath.Join(carDir(ac, "br_fusca"), "skins", "branco", "preview.jpg"), []byte("outra foto"), 0o644)
+	st := StatusForEvent(h, ac, h.Events[0])
+	got := map[string]string{}
+	for _, it := range st.Items {
+		got[it.ID] = it.State
+	}
+	if got["br_opala"] != "outdated" || got["br_fusca"] != "ok" || got["br_band"] != "ok" {
+		t.Fatalf("states = %v", got)
+	}
+}
+
+func TestParseInviteAndSplitTrack(t *testing.T) {
+	cases := map[string]Invite{
+		"acmanager://race/online/join?ip=26.12.3.4&httpPort=8081&password=abc":      {Host: "26.12.3.4", HTTPPort: 8081},
+		"https://acstuff.club/s/q:race/online/join?ip=meu.server.com&httpPort=9000": {Host: "meu.server.com", HTTPPort: 9000},
+		"  192.168.0.10:8081 ": {Host: "192.168.0.10", HTTPPort: 8081},
+	}
+	for in, want := range cases {
+		got, err := ParseInvite(in)
+		if err != nil || got.Host != want.Host || got.HTTPPort != want.HTTPPort {
+			t.Errorf("ParseInvite(%q) = %+v %v", in, got, err)
+		}
+	}
+	inv, _ := ParseInvite("acmanager://race/online/join?ip=1.2.3.4&httpPort=8081&password=a%20b")
+	if l := inv.JoinLink(); !strings.HasPrefix(l, "acmanager://race/online/join?") || !strings.Contains(l, "password=a+b") {
+		t.Errorf("join link %s", l)
+	}
+	for _, bad := range []string{"", "http://evil.com", "acmanager://x?ip=1.2.3.4", "1.2.3.4:99999"} {
+		if _, err := ParseInvite(bad); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+	known := func(id, layout string) bool {
+		return id == "shuto-revival" && layout == "main" || id == "br_av_brasil" && layout == ""
+	}
+	for raw, want := range map[string][2]string{
+		"shuto-revival-main":              {"shuto-revival", "main"},
+		"br_av_brasil":                    {"br_av_brasil", ""},
+		"csp/2144/../H/../ks_red_bull-gp": {"ks_red_bull", "gp"},
+		"desconhecida":                    {"desconhecida", ""},
+	} {
+		if a, b := SplitTrack(raw, known); a != want[0] || b != want[1] {
+			t.Errorf("SplitTrack(%q) = %q %q", raw, a, b)
+		}
+	}
+}
+
+func TestHostCode(t *testing.T) {
+	code := EncodeHostCode("https://site.com.br/ac/upload.php", "abc123")
+	u, k, err := DecodeHostCode(" " + code[:10] + "\n" + code[10:] + " ")
+	if err != nil || u != "https://site.com.br/ac/upload.php" || k != "abc123" {
+		t.Fatalf("decode = %q %q %v", u, k, err)
+	}
+	if _, _, err := DecodeHostCode("LB1-quebrado"); err == nil {
+		t.Fatal("broken code accepted")
 	}
 }
 
@@ -212,88 +284,120 @@ func startPHP(t *testing.T, key string) string {
 	return "http://" + addr + "/upload.php"
 }
 
-func TestRemoteUploadWithRealPHP(t *testing.T) {
-	key := NewKey()
-	endpoint := startPHP(t, key)
-	ctx := context.Background()
-	if err := NewRemote(endpoint, "errada").Ping(ctx); err == nil {
-		t.Fatal("wrong key accepted")
+func waitTask(t *testing.T, pub *Publisher, task *Task) Task {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		tasks, _, _ := pub.act.Snapshot()
+		for _, x := range tasks {
+			if x.ID == task.ID && (x.State == "done" || x.State == "error") {
+				return x
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
 	}
-	r := NewRemote(endpoint, key)
-	if err := r.Ping(ctx); err != nil {
-		t.Fatal(err)
-	}
-	// 10 MB file: three chunks, then resume after a simulated interruption.
-	data := make([]byte, 10<<20+123)
-	for i := range data {
-		data[i] = byte(i * 7)
-	}
-	sum := sha256Hex(data)
-	if err := r.Upload(ctx, bytesOpener(data), "car-x.zip", sum, func(int64, int64) {}); err != nil {
-		t.Fatal(err)
-	}
-	size, _, _ := r.RemoteSize(ctx, "car-x.zip")
-	if size != int64(len(data)) {
-		t.Fatalf("remote size %d", size)
-	}
-	if err := r.Upload(ctx, bytesOpener(data), "car-y.zip", strings.Repeat("0", 64), func(int64, int64) {}); err == nil {
-		t.Fatal("wrong sha accepted")
-	}
-	if err := r.Upload(ctx, bytesOpener([]byte("x")), "../evil.php", "", func(int64, int64) {}); err == nil {
-		t.Fatal("bad name accepted")
-	}
-	if r.FilesURL() != strings.TrimSuffix(endpoint, "/upload.php")+"/files" {
-		t.Fatalf("files url %s", r.FilesURL())
-	}
-	// Served publicly from files/.
-	resp, err := http.Get(r.FilesURL() + "/car-x.zip")
-	if err != nil || resp.StatusCode != 200 || resp.ContentLength != int64(len(data)) {
-		t.Fatalf("public download: %v %v", resp, err)
-	}
+	t.Fatal("task did not finish")
+	return Task{}
 }
 
-func TestPublisherEndToEndWithPHP(t *testing.T) {
+// TestEventsWithRealPHP runs the whole flow against receiver/upload.php:
+// owner creates a host, the host publishes a public and a private event,
+// a player lists, unlocks and installs them.
+func TestEventsWithRealPHP(t *testing.T) {
 	cfg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", cfg)
 	t.Setenv("APPDATA", cfg)
-	key := NewKey()
-	endpoint := startPHP(t, key)
+	ownerKey := NewKey()
+	endpoint := startPHP(t, ownerKey)
+	ctx := context.Background()
+	owner := NewRemote(endpoint, ownerKey)
+	if id, err := owner.Ping(ctx); err != nil || id.Role != "owner" {
+		t.Fatalf("owner ping: %+v %v", id, err)
+	}
+	if _, err := NewRemote(endpoint, "errada").Ping(ctx); err == nil {
+		t.Fatal("wrong key accepted")
+	}
+	if err := owner.Call(ctx, "base-save", map[string]string{"name": "Rodovias BR"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var added struct{ ID, Key string }
+	if err := owner.Call(ctx, "host-add", map[string]string{"name": "Zé do Opala"}, &added); err != nil {
+		t.Fatal(err)
+	}
+	ep, key, _ := DecodeHostCode(EncodeHostCode(endpoint, added.Key))
+	host := NewRemote(ep, key)
+	if id, err := host.Ping(ctx); err != nil || id.Role != "host" || id.Name != "Zé do Opala" {
+		t.Fatalf("host ping: %+v %v", id, err)
+	}
+	if err := host.Call(ctx, "host-list", nil, nil); err == nil {
+		t.Fatal("host managed hosts")
+	}
+	if err := host.Upload(ctx, bytesOpener([]byte("x")), "car-x.php-0123456789ab.zip", "", func(int64, int64) {}); err == nil {
+		t.Fatal("script name accepted")
+	}
+
+	// The host publishes through the Publisher, exactly as the panel does.
 	s := LoadSettings()
 	s.UploadURL, s.UploadKey = endpoint, key
 	SaveSettings(s)
-
-	a, lib := baseFixture(t)
-	SaveAdminBase(LoadSettings().AdminBase, a)
+	lib, _ := eventFixture(t)
 	pub := NewPublisher(lib)
-	pub.SyncAll()
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		_, at, busy := pub.act.Snapshot()
-		if !busy && !at.IsZero() {
-			break
+	pubDraft := EventDraft{Name: "Bandeirantes aberto", Invite: "1.2.3.4:8081", Track: "br_band", Layout: "trafego", Cars: []string{"br_opala", "br_fusca"}}
+	privDraft := EventDraft{Name: "Racha fechado", Private: true, Password: "segredo", LAN: true, RadminNet: "RachaBR", RadminPass: "123",
+		Invite: "acmanager://race/online/join?ip=26.1.2.3&httpPort=8081", Track: "br_band", Layout: "trafego", Cars: []string{"br_opala"}}
+	for _, d := range []EventDraft{pubDraft, privDraft} {
+		task, err := pub.PublishEvent(d)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if time.Now().After(deadline) {
-			tasks, _, _ := pub.act.Snapshot()
-			t.Fatalf("publish did not finish: %+v", tasks)
+		if r := waitTask(t, pub, task); r.State != "done" {
+			t.Fatalf("publish %s: %+v", d.Name, r)
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	hub, err := LoadHub(NewRemote(endpoint, "").HubURL())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(hub.Rooms) != 2 {
-		t.Fatalf("published rooms = %d", len(hub.Rooms))
 	}
 	for _, it := range lib.List() {
 		if !it.Uploaded {
 			t.Fatalf("%s not uploaded", it.ID)
 		}
 	}
-	// A player installs straight from the published base.
+
+	// Player view: the private event is listed but locked.
+	hubLink := NewRemote(endpoint, "").HubURL()
+	hub, err := LoadHub(hubLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hub.Name != "Rodovias BR" || len(hub.Events) != 2 || hub.FilesURL != FilesURLFor(endpoint) {
+		t.Fatalf("hub = %+v", hub)
+	}
+	var open, closed Event
+	for _, e := range hub.Events {
+		if e.Private {
+			closed = e
+		} else {
+			open = e
+		}
+	}
+	if !closed.Locked || closed.Invite != "" || closed.Radmin != nil || closed.Cars[0].File != "" || closed.Host != "Zé do Opala" {
+		t.Fatalf("private event leaks: %+v", closed)
+	}
+	if open.Locked || open.Invite == "" || open.Cars[0].File == "" {
+		t.Fatalf("public event: %+v", open)
+	}
+	if _, err := Unlock(ctx, hubLink, closed.ID, "errada"); err == nil {
+		t.Fatal("wrong event password accepted")
+	}
+	full, err := Unlock(ctx, hubLink, closed.ID, "segredo")
+	if err != nil || full.Locked || full.Radmin == nil || full.Radmin.Network != "RachaBR" || full.Invite == "" {
+		t.Fatalf("unlock: %+v %v", full, err)
+	}
+
+	// Install everything from the site and check the event is ready.
 	ac := t.TempDir()
 	os.MkdirAll(filepath.Join(ac, "content", "cars"), 0o755)
-	items := PendingForRooms(hub, ac, hub.Rooms)
+	items := PendingForEvents(hub, ac, []Event{open})
+	if len(items) != 3 {
+		t.Fatalf("pending = %d", len(items))
+	}
 	var in Installer
 	if _, err := in.Start(hub, ac, items); err != nil {
 		t.Fatal(err)
@@ -302,12 +406,35 @@ func TestPublisherEndToEndWithPHP(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if j := in.Snapshot(); j.Status != "done" {
-		t.Fatalf("install: %+v", j.Items)
+		t.Fatalf("install: %+v", j.Items[0])
 	}
-	for _, r := range hub.Rooms {
-		if st := StatusForRoom(hub, ac, r); !st.Ready {
-			t.Fatalf("room %s not ready: %+v", r.ID, st.Items)
-		}
+	if st := StatusForEvent(hub, ac, open); !st.Ready {
+		t.Fatalf("not ready: %+v", st.Items)
+	}
+
+	// Another host cannot edit or delete it; the owner can.
+	var other struct{ ID, Key string }
+	owner.Call(ctx, "host-add", map[string]string{"name": "Outro"}, &other)
+	intruder := NewRemote(endpoint, other.Key)
+	if err := intruder.Call(ctx, "event-delete", map[string]string{"id": open.ID}, nil); err == nil {
+		t.Fatal("other host deleted the event")
+	}
+	var mine struct{ Events []Event }
+	host.Call(ctx, "my-events", nil, &mine)
+	if len(mine.Events) != 2 {
+		t.Fatalf("my events = %d", len(mine.Events))
+	}
+	if err := owner.Call(ctx, "event-delete", map[string]string{"id": open.ID}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Removing a host removes their events.
+	owner.Call(ctx, "host-remove", map[string]string{"id": added.ID}, nil)
+	if _, err := host.Ping(ctx); err == nil {
+		t.Fatal("removed host still works")
+	}
+	hub, _ = LoadHub(hubLink)
+	if len(hub.Events) != 0 {
+		t.Fatalf("events left: %d", len(hub.Events))
 	}
 }
 
@@ -332,27 +459,21 @@ func TestLiveSlots(t *testing.T) {
 }
 
 func TestModsList(t *testing.T) {
-	a, lib := baseFixture(t)
-	h := BuildHub(a, lib, "https://site/files")
+	_, h := eventFixture(t)
 	ac := t.TempDir()
-	fakeCar(t, ac, "br_opala", "1.0")
 	fakeCar(t, ac, "outro_mod", "")
 	mods := ListMods(ac, h)
 	got := map[string]ModEntry{}
 	for _, m := range mods {
 		got[m.ID] = m
 	}
-	if got["br_fusca"].State != "missing" || got["br_fusca"].Installed || !got["br_fusca"].Required {
+	if got["br_fusca"].State != "missing" || got["br_fusca"].Installed || !got["br_fusca"].Required || len(got["br_fusca"].Events) != 1 {
 		t.Fatalf("fusca: %+v", got["br_fusca"])
-	}
-	if got["br_opala"].State != "ok" || !got["br_opala"].Installed || len(got["br_opala"].Rooms) != 2 {
-		t.Fatalf("opala: %+v", got["br_opala"])
 	}
 	if got["outro_mod"].Required || !got["outro_mod"].Installed || got["outro_mod"].Size == 0 {
 		t.Fatalf("other: %+v", got["outro_mod"])
 	}
-	if mods[0].State != "missing" {
+	if !mods[0].Required || mods[0].State == "ok" {
 		t.Fatalf("missing items should come first: %+v", mods[0])
 	}
-	var _ = zip.Store
 }
