@@ -8,30 +8,20 @@
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<header class="top">
-  <div class="wrap">
-    <div class="brand"><span class="mark"><i></i></span> Painel da base <small>Launcher Brasil {{VERSION}}</small></div>
-    <div class="spacer"></div>
-    <div class="savebar">
-      <span class="dirty" id="dirty" hidden>Alterações não salvas</span>
-      <button class="btn primary" id="save">Salvar base</button>
-      <a class="btn ghost" href="/">Ver como jogador</a>
-    </div>
-  </div>
-</header>
-
-<main class="wrap admin">
-  <nav class="nav" id="nav" aria-label="Seções">
-    <button data-sec="base">Base</button>
-    <button data-sec="modes">Modos de jogo</button>
-    <button data-sec="rooms">Salas</button>
-    <button data-sec="packages">Pacotes</button>
-    <button data-sec="publish">Publicar</button>
-    <button data-sec="paths">Pastas</button>
+<div class="shell">
+  <nav class="rail" aria-label="Menu do administrador">
+    <div class="logo" title="Launcher Brasil {{VERSION}}"><i></i></div>
+    <a href="#/conteudo" data-nav="conteudo"></a>
+    <a href="#/salas" data-nav="salas"></a>
+    <a href="#/conexao" data-nav="conexao"></a>
+    <div class="grow"></div>
+    <a href="/" data-nav="jogador"></a>
   </nav>
-  <div id="content"></div>
-</main>
-
+  <main class="main" id="main"></main>
+</div>
+<div class="drop-overlay" id="overlay">Solte os .zip para adicionar à base</div>
+<input type="file" id="filePick" accept=".zip" multiple hidden>
+<dialog id="dlg"></dialog>
 <script src="/static/common.js"></script>
 <script src="/static/admin.js"></script>
 </body>

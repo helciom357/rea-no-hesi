@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -91,10 +92,17 @@ func PendingForRooms(h *Hub, acRoot string, rooms []Room) []Item {
 
 // LiveInfo is what the AC/AssettoServer HTTP port reports right now.
 type LiveInfo struct {
-	Online     bool   `json:"online"`
-	Clients    int    `json:"clients"`
-	MaxClients int    `json:"maxClients"`
-	Error      string `json:"error,omitempty"`
+	Online     bool                `json:"online"`
+	Clients    int                 `json:"clients"`
+	MaxClients int                 `json:"maxClients"`
+	PingMs     int                 `json:"pingMs"`
+	Slots      map[string]SlotInfo `json:"slots,omitempty"` // per car model
+	Error      string              `json:"error,omitempty"`
+}
+
+type SlotInfo struct {
+	Total int `json:"total"`
+	Free  int `json:"free"`
 }
 
 var liveClient = &http.Client{Timeout: 4 * time.Second}
@@ -103,19 +111,43 @@ func FetchLive(s ServerAddr) LiveInfo {
 	if s.Host == "" || s.HTTPPort == 0 {
 		return LiveInfo{Error: "sem endereço"}
 	}
-	resp, err := liveClient.Get(fmt.Sprintf("http://%s:%d/INFO", s.Host, s.HTTPPort))
+	base := fmt.Sprintf("http://%s:%d", s.Host, s.HTTPPort)
+	start := time.Now()
+	resp, err := liveClient.Get(base + "/INFO")
 	if err != nil {
 		return LiveInfo{Error: "offline"}
 	}
-	defer resp.Body.Close()
+	li := LiveInfo{Online: true, PingMs: int(time.Since(start).Milliseconds())}
 	var v struct {
 		Clients    int `json:"clients"`
 		MaxClients int `json:"maxclients"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		return LiveInfo{Online: true}
+	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&v) == nil {
+		li.Clients, li.MaxClients = v.Clients, v.MaxClients
 	}
-	return LiveInfo{Online: true, Clients: v.Clients, MaxClients: v.MaxClients}
+	resp.Body.Close()
+	// The entry list says how many slots each car has and which are taken.
+	if r2, err := liveClient.Get(base + "/JSON%7C0"); err == nil {
+		var el struct {
+			Cars []struct {
+				Model       string `json:"Model"`
+				IsConnected bool   `json:"IsConnected"`
+			} `json:"Cars"`
+		}
+		if json.NewDecoder(io.LimitReader(r2.Body, 4<<20)).Decode(&el) == nil && len(el.Cars) > 0 {
+			li.Slots = map[string]SlotInfo{}
+			for _, c := range el.Cars {
+				si := li.Slots[c.Model]
+				si.Total++
+				if !c.IsConnected {
+					si.Free++
+				}
+				li.Slots[c.Model] = si
+			}
+		}
+		r2.Body.Close()
+	}
+	return li
 }
 
 func FetchLiveAll(rooms []Room) map[string]LiveInfo {

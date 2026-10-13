@@ -14,11 +14,13 @@ import (
 
 // Settings are the player's local preferences, stored in the user config dir.
 type Settings struct {
-	ACPath     string `json:"acPath"`
-	HubSource  string `json:"hubSource"`  // URL or local path of hub.json
+	ACPath    string `json:"acPath"`
+	HubSource string `json:"hubSource"` // URL or local path of hub.json
+	// Admin side.
 	AdminBase  string `json:"adminBase"`  // path of the admin's base.json
-	PackageDir string `json:"packageDir"` // folder with the admin's .zip packages
-	ExportDir  string `json:"exportDir"`  // where the admin exports hub.json/content.json
+	LibraryDir string `json:"libraryDir"` // packages added to the base
+	UploadURL  string `json:"uploadUrl"`  // https://site/ac/upload.php
+	UploadKey  string `json:"uploadKey"`
 }
 
 var settingsMu sync.Mutex
@@ -62,11 +64,8 @@ func LoadSettings() Settings {
 	if s.AdminBase == "" {
 		s.AdminBase = filepath.Join(appDir(), "base.json")
 	}
-	if s.PackageDir == "" {
-		s.PackageDir = filepath.Join(appDir(), "pacotes")
-	}
-	if s.ExportDir == "" {
-		s.ExportDir = filepath.Join(appDir(), "publicar")
+	if s.LibraryDir == "" {
+		s.LibraryDir = filepath.Join(appDir(), "conteudo")
 	}
 	return s
 }
@@ -75,7 +74,19 @@ func SaveSettings(s Settings) error {
 	settingsMu.Lock()
 	defer settingsMu.Unlock()
 	b, _ := json.MarshalIndent(s, "", "  ")
-	return os.WriteFile(settingsPath(), b, 0o644)
+	return os.WriteFile(settingsPath(), b, 0o600) // holds the upload key
+}
+
+// EffectiveHub is where the player view reads the base from: the configured
+// link, or the admin's own published base on this PC.
+func (s Settings) EffectiveHub() string {
+	if s.HubSource != "" {
+		return s.HubSource
+	}
+	if s.UploadURL != "" {
+		return NewRemote(s.UploadURL, "").HubURL()
+	}
+	return ""
 }
 
 // IsACRoot reports whether dir looks like an Assetto Corsa install.

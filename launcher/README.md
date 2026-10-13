@@ -1,67 +1,63 @@
 # Launcher Brasil
 
-Um único executável para Windows que deixa o jogador pronto para entrar nas
-salas da base brasileira de Assetto Corsa (Av. Brasil, Bandeirantes, Washington
-Luís, Interlagos…), e um painel para o administrador montar essa base.
+Um único executável para Windows com duas partes:
 
-O launcher não substitui o Content Manager: ele confere e instala o conteúdo
-que falta, e o Content Manager continua fazendo a conexão com o servidor.
+- **Jogador** — servidores agrupados por pista com abas de modo, página da sala
+  com os carros exigidos e as vagas, instalação do conteúdo faltante em um
+  clique e "Meus mods" (o que está instalado × o que a base precisa). A
+  entrada no servidor continua pelo Content Manager.
+- **Administrador** (`LauncherBrasil.exe -admin`) — arraste os `.zip` de carros
+  e pistas, monte as salas e pronto: o envio para o site e a publicação são
+  automáticos.
+
+## Como o administrador usa
+
+1. **Conexão** (uma vez): baixe o `upload.php`, envie para uma pasta do site
+   (na Hostinger: Gerenciador de Arquivos → `public_html/ac/`), cole o
+   endereço `https://seusite.com.br/ac/upload.php` e clique em Conectar.
+   Passe aos jogadores o link mostrado (`…/ac/files/hub.json`).
+2. **Conteúdo**: arraste os `.zip`. Um pack com vários carros vira um item por
+   carro. Arrastar de novo um mod alterado cria a versão seguinte (1.0 → 1.1)
+   e os jogadores recebem a atualização. Mods em `.7z`/`.rar`: instale no seu
+   Assetto e use "Adicionar do meu Assetto".
+3. **Salas**: nome, modo, `IP:porta HTTP` do servidor, pista e carros. Salvar
+   já publica. Salas incompletas ficam fora do ar até serem completadas.
+
+Opcional: em cada sala há o `content.json` para `cfg/cm_content/` do
+AssettoServer, para quem entra pelo Content Manager sem o launcher.
 
 ## Como funciona
 
 ```
-Painel do admin ──gera──▶ hub.json ──────────────▶ Launcher do jogador
-      │                   (salas, modos, carros,         │
-      │                    pista, versão, link)          │ compara com a pasta
-      │                                                  │ do Assetto e instala
-      └──gera──▶ cfg/cm_content/content.json             │ o que falta
-                 (um por servidor AssettoServer)         ▼
-                         │                     Entrar pelo Content Manager
-                         └──── /api/details ────▶ (acmanager://…)
+Painel ──zip──▶ biblioteca local (pacote normalizado + versão + sha256 + imagem)
+   │                        │ upload em partes de 4 MB, com retomada
+   │                        ▼
+   └──hub.json──▶  site/ac/files/  ◀── launcher do jogador
+                                        compara com content/cars|tracks,
+                                        baixa, confere sha256, instala,
+                                        abre a sala no Content Manager
 ```
 
-Para cada carro e pista de uma sala, o launcher classifica:
+- Versão por conteúdo: o painel calcula uma impressão digital dos arquivos do
+  mod; reenviar o mesmo mod não muda nada, mod alterado ganha versão nova.
+- O `upload.php` guarda só o hash da chave, aceita apenas `.zip`, `.json` e
+  imagens, verifica o sha256 antes de publicar o arquivo e bloqueia scripts na
+  pasta `files/`.
+- O jogador só baixa por HTTPS do domínio da base; a instalação extrai numa
+  pasta temporária e troca a pasta inteira, sem deixar mod pela metade.
+- Estados de cada item: Falta baixar, Danificado (faltam `data.acd`, `.kn5`,
+  `collider.kn5`, `models.ini`, `surfaces.ini`…) e Atualizar (versão menor).
 
-| Estado | Quando |
-| --- | --- |
-| **Falta** | a pasta não existe em `content/cars` ou `content/tracks` |
-| **Danificado** | falta `data.acd`, `ui/ui_car.json`, `.kn5`, `collider.kn5` (carros) ou `models.ini`, `data/surfaces.ini`, `ui_track.json` (pistas) |
-| **Desatualizado** | o campo `version` do `ui_car.json`/`ui_track.json` local é menor que o da base |
-
-A instalação baixa até 3 pacotes ao mesmo tempo, confere o `sha256`, extrai
-numa pasta temporária e só então substitui a pasta antiga — uma instalação que
-falha não deixa um mod pela metade. Downloads só são aceitos via HTTPS dos
-hosts permitidos pela base.
-
-## Uso
-
-- **Jogador:** abra `LauncherBrasil.exe`. Em *Ajustes*, confirme a pasta do
-  Assetto Corsa (detectada pela Steam) e cole o link do `hub.json` da base. Um
-  `hub.json` colocado ao lado do `.exe` é usado automaticamente.
-- **Administrador:** abra `LauncherBrasil.exe -admin` (ou *Ajustes → Painel do
-  administrador*).
-  1. *Pacotes → Empacotar do meu Assetto Corsa*: gera o `.zip` de cada carro ou
-     pista já instalado no seu PC, gravando a versão dentro do pacote.
-  2. *Salas*: cadastre servidor, pista e carros escolhendo os pacotes.
-  3. *Publicar*: gera `hub.json` e `servidores/<sala>/cfg/cm_content/content.json`.
-  4. Suba os `.zip` para o endereço de downloads, o `hub.json` para o site e o
-     `cfg/cm_content/content.json` para cada AssettoServer.
-
-Sempre que alterar um mod, empacote de novo com uma versão maior. É isso que
-faz os jogadores receberem a atualização e evita o erro de checksum no
-handshake.
-
-Os dados do launcher ficam em `%APPDATA%\LauncherBrasil` (ajustes, `base.json`,
-pacotes e publicação).
+Dados locais em `%APPDATA%\LauncherBrasil` (ajustes, `base.json`, `conteudo/`).
 
 ## Compilar
 
-Requer Go 1.24+. Não há dependências externas.
+Go 1.24+, sem dependências externas.
 
 ```sh
 cd launcher
-go test ./...
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=0.1.0" -o dist/LauncherBrasil.exe .
+go test ./...            # inclui teste de upload real se houver `php` no PATH
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=0.2.0" -o dist/LauncherBrasil.exe .
 ```
 
-No Windows (PowerShell): `./build.ps1`.
+No Windows: `./build.ps1`.

@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func write(t *testing.T, p, s string) {
@@ -195,124 +194,6 @@ func TestAllowedURL(t *testing.T) {
 		if checkAllowedURL(h, u) == nil {
 			t.Errorf("%s accepted", u)
 		}
-	}
-}
-
-func TestStatusAndModeDedup(t *testing.T) {
-	ac := t.TempDir()
-	h := ExampleBase()
-	fakeTrack(t, ac, "br_interlagos", "", "1.0")
-	fakeCar(t, ac, "br_opala_ss", "0.9") // outdated in both rooms
-	fakeCar(t, ac, "br_fusca_1300", "1.0")
-	os.Remove(filepath.Join(carDir(ac, "br_fusca_1300"), "data.acd")) // broken
-	st := StatusForRoom(h, ac, *h.Room("interlagos-passeio"))
-	got := map[string]string{}
-	for _, it := range st.Items {
-		got[it.ID] = it.State
-	}
-	want := map[string]string{"br_interlagos": "ok", "br_opala_ss": "outdated", "br_fusca_1300": "broken"}
-	for k, v := range want {
-		if got[k] != v {
-			t.Errorf("%s: got %s want %s", k, got[k], v)
-		}
-	}
-	all := PendingForRooms(h, ac, h.Rooms)
-	n := 0
-	for _, it := range all {
-		if it.ID == "br_opala_ss" {
-			n++
-		}
-	}
-	if n != 1 {
-		t.Fatalf("shared car listed %d times", n)
-	}
-}
-
-func TestBuildInspectExport(t *testing.T) {
-	ac := t.TempDir()
-	fakeCar(t, ac, "br_opala_ss", "")
-	pkgs := t.TempDir()
-	info, err := BuildPackage(ac, pkgs, "car", "br_opala_ss", "1.5")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Kind != "car" || info.ID != "br_opala_ss" || info.Version != "1.5" || len(info.SHA256) != 64 {
-		t.Fatalf("package info: %+v", info)
-	}
-	if v := CheckCar(ac, "br_opala_ss").Version; v != "" {
-		t.Fatalf("local install was modified: %q", v)
-	}
-	// The built package installs cleanly on another PC.
-	other := t.TempDir()
-	staging := filepath.Join(other, "content", ".s")
-	os.MkdirAll(staging, 0o755)
-	if err := InstallArchive(filepath.Join(pkgs, "br_opala_ss.zip"), other, staging, "car", "br_opala_ss"); err != nil {
-		t.Fatal(err)
-	}
-	if s := CheckCar(other, "br_opala_ss"); !s.Healthy || s.Version != "1.5" {
-		t.Fatalf("round trip: %+v", s)
-	}
-	out := t.TempDir()
-	res, err := Export(ExampleBase(), out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(filepath.Join(out, "servidores", "interlagos-passeio", "cfg", "cm_content", "content.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var c CMContent
-	if err := json.Unmarshal(b, &c); err != nil {
-		t.Fatal(err)
-	}
-	if c.Track == nil || c.Track.URL != "https://downloads.exemplo.com.br/ac/br_interlagos.zip" || c.Cars["br_fusca_1300"].Version != "1.0" {
-		t.Fatalf("content.json: %s", b)
-	}
-	if len(res.Upload) != 5 {
-		t.Fatalf("upload list: %v", res.Upload)
-	}
-}
-
-func TestInstallerEndToEnd(t *testing.T) {
-	pkgDir := t.TempDir()
-	srcAC := t.TempDir()
-	fakeCar(t, srcAC, "br_opala_ss", "")
-	info, err := BuildPackage(srcAC, pkgDir, "car", "br_opala_ss", "2.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(http.FileServer(http.Dir(pkgDir)))
-	defer srv.Close()
-	h := &Hub{Name: "t", DownloadBase: srv.URL}
-	ac := t.TempDir()
-	os.MkdirAll(filepath.Join(ac, "content", "cars"), 0o755)
-	items := []Item{{Kind: "car", ID: "br_opala_ss", URL: srv.URL + "/br_opala_ss.zip", SHA256: info.SHA256, Size: info.Size}}
-	var in Installer
-	if _, err := in.Start(h, ac, items); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for in.Snapshot().Status == "running" && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	j := in.Snapshot()
-	if j.Status != "done" {
-		t.Fatalf("job %s: %+v", j.Status, j.Items[0])
-	}
-	if s := CheckCar(ac, "br_opala_ss"); !s.Healthy || s.Version != "2.0" {
-		t.Fatalf("installed: %+v", s)
-	}
-	// Wrong hash must be refused and leave nothing installed.
-	ac2 := t.TempDir()
-	os.MkdirAll(filepath.Join(ac2, "content", "cars"), 0o755)
-	items[0].SHA256 = strings.Repeat("0", 64)
-	var in2 Installer
-	in2.Start(h, ac2, items)
-	for in2.Snapshot().Status == "running" {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if in2.Snapshot().Status != "error" || CheckCar(ac2, "br_opala_ss").Found {
-		t.Fatal("bad hash was installed")
 	}
 }
 

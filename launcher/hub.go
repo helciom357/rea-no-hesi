@@ -39,11 +39,12 @@ type Room struct {
 	Server      ServerAddr     `json:"server"`
 	Track       ContentEntry   `json:"track"`
 	Cars        []ContentEntry `json:"cars"`
+	Image       string         `json:"image,omitempty"`
 }
 
 type ServerAddr struct {
 	Host     string `json:"host"`
-	TCPPort  int    `json:"tcpPort"`
+	TCPPort  int    `json:"tcpPort,omitempty"`
 	HTTPPort int    `json:"httpPort"`
 	Password bool   `json:"password,omitempty"`
 }
@@ -59,6 +60,7 @@ type ContentEntry struct {
 	File    string `json:"file,omitempty"` // package file name, combined with DownloadBase when URL is empty
 	SHA256  string `json:"sha256,omitempty"`
 	Size    int64  `json:"size,omitempty"`
+	Image   string `json:"image,omitempty"`
 }
 
 var safeID = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}$`)
@@ -185,7 +187,12 @@ func LoadHub(src string) (*Hub, error) {
 	}
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
 		c := &http.Client{Timeout: 20 * time.Second}
-		resp, err := c.Get(src)
+		sep := "?"
+		if strings.Contains(src, "?") {
+			sep = "&"
+		}
+		// Hosting caches often hold .json files; always ask for the latest.
+		resp, err := c.Get(src + sep + "t=" + fmt.Sprint(time.Now().Unix()))
 		if err != nil {
 			return nil, fmt.Errorf("não foi possível baixar a base: %w", err)
 		}

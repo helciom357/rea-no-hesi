@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/url"
@@ -14,8 +15,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 //go:embed web
@@ -24,15 +27,20 @@ var webFS embed.FS
 type App struct {
 	token     string
 	installer Installer
-	mu        sync.Mutex
-	hub       *Hub // last hub loaded for the player view
+	lib       *Library
+	pub       *Publisher
 	addr      string
+
+	mu  sync.Mutex
+	hub *Hub // last hub loaded for the player view
 }
 
 func NewApp() *App {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
-	return &App{token: hex.EncodeToString(b)}
+	s := LoadSettings()
+	lib := OpenLibrary(s.LibraryDir)
+	return &App{token: hex.EncodeToString(b), lib: lib, pub: NewPublisher(lib)}
 }
 
 func (a *App) Handler() http.Handler {
@@ -41,6 +49,13 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", a.page("player.html"))
 	mux.HandleFunc("GET /admin", a.page("admin.html"))
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(static))))
+
+	// Images and downloads are opened by <img>/<a>, which cannot send headers,
+	// so they carry the token in the query instead.
+	mux.Handle("GET /img/local", a.guardQuery(http.HandlerFunc(a.imgLocal)))
+	mux.Handle("GET /img/lib", a.guardQuery(http.HandlerFunc(a.imgLib)))
+	mux.Handle("GET /dl/upload.php", a.guardQuery(http.HandlerFunc(a.dlReceiver)))
+	mux.Handle("GET /dl/content.json", a.guardQuery(http.HandlerFunc(a.dlContentJSON)))
 
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/state", a.getState)
@@ -51,13 +66,17 @@ func (a *App) Handler() http.Handler {
 	api.HandleFunc("GET /api/job", a.getJob)
 	api.HandleFunc("POST /api/job/cancel", a.postCancel)
 	api.HandleFunc("POST /api/join", a.postJoin)
-	api.HandleFunc("GET /api/admin/base", a.getBase)
-	api.HandleFunc("PUT /api/admin/base", a.putBase)
-	api.HandleFunc("GET /api/admin/packages", a.getPackages)
-	api.HandleFunc("GET /api/admin/local", a.getLocal)
-	api.HandleFunc("POST /api/admin/package", a.postPackage)
-	api.HandleFunc("POST /api/admin/export", a.postExport)
-	api.HandleFunc("POST /api/admin/open", a.postOpen)
+	api.HandleFunc("GET /api/mods", a.getMods)
+	api.HandleFunc("POST /api/mods/open", a.postOpenMod)
+
+	api.HandleFunc("GET /api/admin/state", a.adminState)
+	api.HandleFunc("PUT /api/admin/base", a.adminPutBase)
+	api.HandleFunc("POST /api/admin/drop", a.adminDrop)
+	api.HandleFunc("POST /api/admin/library/remove", a.adminRemove)
+	api.HandleFunc("GET /api/admin/installed", a.adminInstalled)
+	api.HandleFunc("POST /api/admin/installed/add", a.adminAddInstalled)
+	api.HandleFunc("POST /api/admin/connection", a.adminConnection)
+	api.HandleFunc("POST /api/admin/publish", a.adminPublish)
 	mux.Handle("/api/", a.guard(api))
 	return mux
 }
@@ -67,6 +86,16 @@ func (a *App) Handler() http.Handler {
 func (a *App) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Host != a.addr || r.Header.Get("X-Token") != a.token {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) guardQuery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != a.addr || r.URL.Query().Get("t") != a.token {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -85,7 +114,7 @@ func (a *App) page(name string) http.HandlerFunc {
 		html = strings.ReplaceAll(html, "{{VERSION}}", Version)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http:; connect-src 'self'")
 		_, _ = w.Write([]byte(html))
 	}
 }
@@ -103,18 +132,20 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 
 func readJSON(r *http.Request, v any) error {
 	defer r.Body.Close()
-	return json.NewDecoder(http.MaxBytesReader(nil, r.Body, 16<<20)).Decode(v)
+	return json.NewDecoder(io.LimitReader(r.Body, 16<<20)).Decode(v)
 }
 
-// ---- player -----------------------------------------------------------------
+// ---- player -------------------------------------------------------------------
 
 func (a *App) getState(w http.ResponseWriter, r *http.Request) {
 	s := LoadSettings()
 	writeJSON(w, map[string]any{
-		"version":  Version,
-		"settings": s,
-		"acValid":  IsACRoot(s.ACPath),
-		"detected": DetectACPath(),
+		"version":   Version,
+		"acPath":    s.ACPath,
+		"hubSource": s.HubSource,
+		"hubUsed":   s.EffectiveHub(),
+		"acValid":   IsACRoot(s.ACPath),
+		"isAdmin":   s.UploadURL != "",
 	})
 }
 
@@ -125,69 +156,57 @@ func (a *App) postSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s := LoadSettings()
-	for k, v := range in {
-		v = strings.TrimSpace(v)
-		switch k {
-		case "acPath":
-			s.ACPath = v
-		case "hubSource":
-			s.HubSource = v
-		case "adminBase":
-			s.AdminBase = v
-		case "packageDir":
-			s.PackageDir = v
-		case "exportDir":
-			s.ExportDir = v
-		}
+	if v, ok := in["acPath"]; ok {
+		s.ACPath = strings.Trim(strings.TrimSpace(v), `"`)
+	}
+	if v, ok := in["hubSource"]; ok {
+		s.HubSource = strings.Trim(strings.TrimSpace(v), `"`)
 	}
 	if err := SaveSettings(s); err != nil {
 		writeErr(w, 500, err)
 		return
 	}
-	writeJSON(w, map[string]any{"settings": s, "acValid": IsACRoot(s.ACPath)})
+	writeJSON(w, map[string]any{"acValid": IsACRoot(s.ACPath)})
 }
 
-type modeSummary struct {
-	Mode
-	Rooms     []string `json:"rooms"`
-	Pending   int      `json:"pending"`
-	PendingMB float64  `json:"pendingMB"`
-}
-
-func (a *App) getHub(w http.ResponseWriter, r *http.Request) {
+func (a *App) loadHub() (*Hub, Settings, error) {
 	s := LoadSettings()
-	h, err := LoadHub(s.HubSource)
+	h, err := LoadHub(s.EffectiveHub())
 	if err != nil {
-		writeErr(w, 400, err)
-		return
+		return nil, s, err
 	}
 	a.mu.Lock()
 	a.hub = h
 	a.mu.Unlock()
+	return h, s, nil
+}
+
+type modeSummary struct {
+	Mode
+	Pending int `json:"pending"`
+}
+
+func (a *App) getHub(w http.ResponseWriter, r *http.Request) {
+	h, s, err := a.loadHub()
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
 	statuses := map[string]RoomStatus{}
 	for _, room := range h.Rooms {
 		statuses[room.ID] = StatusForRoom(h, s.ACPath, room)
 	}
-	var modes []modeSummary
+	modes := []modeSummary{}
 	for _, m := range h.Modes {
-		ms := modeSummary{Mode: m, Rooms: []string{}}
 		var rooms []Room
 		for _, room := range h.Rooms {
 			if room.ModeID == m.ID {
-				ms.Rooms = append(ms.Rooms, room.ID)
 				rooms = append(rooms, room)
 			}
 		}
-		for _, it := range PendingForRooms(h, s.ACPath, rooms) {
-			ms.Pending++
-			ms.PendingMB += float64(it.Size) / (1 << 20)
-		}
-		modes = append(modes, ms)
+		modes = append(modes, modeSummary{Mode: m, Pending: len(PendingForRooms(h, s.ACPath, rooms))})
 	}
-	writeJSON(w, map[string]any{
-		"hub": h, "statuses": statuses, "modes": modes,
-		"acValid": IsACRoot(s.ACPath), "problems": h.Validate(),
-	})
+	writeJSON(w, map[string]any{"hub": h, "statuses": statuses, "modes": modes, "acValid": IsACRoot(s.ACPath)})
 }
 
 func (a *App) getLive(w http.ResponseWriter, r *http.Request) {
@@ -211,33 +230,23 @@ func (a *App) postInstall(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	s := LoadSettings()
-	h, err := LoadHub(s.HubSource)
+	h, s, err := a.loadHub()
 	if err != nil {
 		writeErr(w, 400, err)
 		return
 	}
 	var rooms []Room
+	all := len(in.RoomIDs) == 0 && in.ModeID == ""
 	for _, room := range h.Rooms {
-		if room.ModeID == in.ModeID && in.ModeID != "" {
+		if all || (in.ModeID != "" && room.ModeID == in.ModeID) || contains(in.RoomIDs, room.ID) {
 			rooms = append(rooms, room)
-			continue
-		}
-		for _, id := range in.RoomIDs {
-			if room.ID == id {
-				rooms = append(rooms, room)
-			}
 		}
 	}
 	items := PendingForRooms(h, s.ACPath, rooms)
 	if len(in.Only) > 0 {
-		keep := map[string]bool{}
-		for _, k := range in.Only {
-			keep[k] = true
-		}
 		var f []Item
 		for _, it := range items {
-			if keep[it.Key()] {
+			if contains(in.Only, it.Key()) {
 				f = append(f, it)
 			}
 		}
@@ -263,7 +272,7 @@ func (a *App) postCancel(w http.ResponseWriter, r *http.Request) {
 }
 
 // postJoin hands the server to Content Manager, which performs the real
-// connection (and its own checks) exactly as if the player had clicked Join.
+// connection exactly as if the player had clicked Join there.
 func (a *App) postJoin(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		RoomID string `json:"roomId"`
@@ -272,8 +281,7 @@ func (a *App) postJoin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	s := LoadSettings()
-	h, err := LoadHub(s.HubSource)
+	h, s, err := a.loadHub()
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -283,8 +291,7 @@ func (a *App) postJoin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, errors.New("sala não encontrada"))
 		return
 	}
-	st := StatusForRoom(h, s.ACPath, *room)
-	if !st.Ready {
+	if st := StatusForRoom(h, s.ACPath, *room); !st.Ready {
 		writeErr(w, 400, fmt.Errorf("ainda faltam %d itens para esta sala", st.Pending))
 		return
 	}
@@ -299,42 +306,155 @@ func (a *App) postJoin(w http.ResponseWriter, r *http.Request) {
 func JoinLink(s ServerAddr) string {
 	q := url.Values{}
 	q.Set("ip", s.Host)
-	q.Set("httpPort", fmt.Sprint(s.HTTPPort))
+	q.Set("httpPort", strconv.Itoa(s.HTTPPort))
 	return "acmanager://race/online/join?" + q.Encode()
 }
 
-// ---- admin ------------------------------------------------------------------
-
-func (a *App) getBase(w http.ResponseWriter, r *http.Request) {
+func (a *App) getMods(w http.ResponseWriter, r *http.Request) {
 	s := LoadSettings()
-	h, err := LoadBase(s.AdminBase)
+	a.mu.Lock()
+	h := a.hub
+	a.mu.Unlock()
+	if h == nil {
+		h, _, _ = a.loadHub()
+	}
+	writeJSON(w, map[string]any{"acValid": IsACRoot(s.ACPath), "items": ListMods(s.ACPath, h)})
+}
+
+func (a *App) postOpenMod(w http.ResponseWriter, r *http.Request) {
+	var in struct{ Kind, ID string }
+	if err := readJSON(r, &in); err != nil || !ValidID(in.ID) {
+		writeErr(w, 400, errors.New("pedido inválido"))
+		return
+	}
+	s := LoadSettings()
+	dir := carDir(s.ACPath, in.ID)
+	if in.Kind == "track" {
+		dir = trackDir(s.ACPath, in.ID)
+	}
+	if !exists(dir) {
+		writeErr(w, 404, errors.New("pasta não encontrada"))
+		return
+	}
+	if err := openExternal(dir); err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (a *App) imgLocal(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	p := LocalPreview(LoadSettings().ACPath, q.Get("kind"), q.Get("id"))
+	if p == "" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "max-age=300")
+	http.ServeFile(w, r, p)
+}
+
+// ---- admin --------------------------------------------------------------------
+
+type adminRoomView struct {
+	AdminRoom
+	Problems []string `json:"problems"`
+}
+
+func (a *App) adminState(w http.ResponseWriter, r *http.Request) {
+	s := LoadSettings()
+	base, err := LoadAdminBase(s.AdminBase)
 	if err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	writeJSON(w, map[string]any{"base": h, "problems": h.Validate(), "settings": s, "saved": exists(s.AdminBase)})
+	rooms := []adminRoomView{}
+	for _, room := range base.Rooms {
+		p := RoomProblems(room, a.lib)
+		if p == nil {
+			p = []string{}
+		}
+		rooms = append(rooms, adminRoomView{room, p})
+	}
+	tasks, published, busy := a.pub.act.Snapshot()
+	conn := map[string]any{"url": s.UploadURL, "configured": s.UploadURL != "" && s.UploadKey != ""}
+	if s.UploadURL != "" {
+		rm := NewRemote(s.UploadURL, "")
+		conn["hubUrl"] = rm.HubURL()
+		conn["filesUrl"] = rm.FilesURL()
+	}
+	pub := ""
+	if !published.IsZero() {
+		pub = published.Format(time.RFC3339)
+	}
+	writeJSON(w, map[string]any{
+		"name": base.Name, "description": base.Description, "rooms": rooms,
+		"library": a.lib.List(), "connection": conn,
+		"tasks": tasks, "busy": busy, "publishedAt": pub, "publishError": a.pub.LastError(),
+		"acValid": IsACRoot(s.ACPath),
+	})
 }
 
-func (a *App) putBase(w http.ResponseWriter, r *http.Request) {
-	var h Hub
-	if err := readJSON(r, &h); err != nil {
+func (a *App) adminPutBase(w http.ResponseWriter, r *http.Request) {
+	var in AdminBase
+	if err := readJSON(r, &in); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
 	s := LoadSettings()
-	if err := SaveBase(s.AdminBase, &h); err != nil {
+	if err := SaveAdminBase(s.AdminBase, &in); err != nil {
 		writeErr(w, 500, err)
 		return
 	}
-	writeJSON(w, map[string]any{"problems": h.Validate()})
+	a.pub.SchedulePublish()
+	writeJSON(w, map[string]any{"rooms": in.Rooms})
 }
 
-func (a *App) getPackages(w http.ResponseWriter, r *http.Request) {
-	s := LoadSettings()
-	writeJSON(w, map[string]any{"dir": s.PackageDir, "packages": ListPackages(s.PackageDir)})
+// adminDrop receives a zip dragged into the panel as a raw body.
+func (a *App) adminDrop(w http.ResponseWriter, r *http.Request) {
+	name := filepath.Base(r.Header.Get("X-Filename"))
+	if dec, err := url.QueryUnescape(name); err == nil {
+		name = dec
+	}
+	if !strings.EqualFold(filepath.Ext(name), ".zip") {
+		writeErr(w, 400, fmt.Errorf("%s: só arquivos .zip (para .7z e .rar, instale no Assetto e use \"Adicionar do meu Assetto\")", name))
+		return
+	}
+	tmpDir := filepath.Join(a.lib.dir, "tmp")
+	_ = os.MkdirAll(tmpDir, 0o755)
+	f, err := os.CreateTemp(tmpDir, "drop-*.zip")
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	_, err = io.Copy(f, r.Body)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		writeErr(w, 500, fmt.Errorf("falha ao receber %s: %w", name, err))
+		return
+	}
+	t := a.pub.Import(f.Name(), name, true)
+	writeJSON(w, t)
 }
 
-func (a *App) getLocal(w http.ResponseWriter, r *http.Request) {
+func (a *App) adminRemove(w http.ResponseWriter, r *http.Request) {
+	var in struct{ Kind, ID string }
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if err := a.lib.Remove(in.Kind, in.ID); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	a.pub.SchedulePublish()
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (a *App) adminInstalled(w http.ResponseWriter, r *http.Request) {
 	s := LoadSettings()
 	kind := r.URL.Query().Get("kind")
 	if kind != "track" {
@@ -343,58 +463,107 @@ func (a *App) getLocal(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"acValid": IsACRoot(s.ACPath), "items": ListLocalContent(s.ACPath, kind)})
 }
 
-func (a *App) postPackage(w http.ResponseWriter, r *http.Request) {
+func (a *App) adminAddInstalled(w http.ResponseWriter, r *http.Request) {
+	var in struct{ Kind, ID string }
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	s := LoadSettings()
+	t := a.pub.act.Add("import", "Copiando "+in.ID+" do seu Assetto")
+	a.pub.act.Enqueue(func() {
+		a.pub.act.Set(t, func(t *Task) { t.State = "running" })
+		zipPath, err := ZipInstalled(s.ACPath, in.Kind, in.ID, filepath.Join(a.lib.dir, "tmp"))
+		if err != nil {
+			a.pub.act.Set(t, func(t *Task) { t.State, t.Error = "error", err.Error() })
+			return
+		}
+		a.pub.act.Set(t, func(t *Task) { t.State = "done" })
+		a.pub.Import(zipPath, in.ID, true)
+	})
+	writeJSON(w, t)
+}
+
+func (a *App) adminConnection(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Kind, ID, Version string
+		URL      string `json:"url"`
+		NewKey   bool   `json:"newKey"`
+		TestOnly bool   `json:"testOnly"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
 	s := LoadSettings()
-	info, err := BuildPackage(s.ACPath, s.PackageDir, in.Kind, in.ID, strings.TrimSpace(in.Version))
-	if err != nil {
-		writeErr(w, 400, err)
-		return
+	if in.NewKey || s.UploadKey == "" {
+		s.UploadKey = NewKey()
 	}
-	writeJSON(w, info)
-}
-
-func (a *App) postExport(w http.ResponseWriter, r *http.Request) {
-	s := LoadSettings()
-	h, err := LoadBase(s.AdminBase)
-	if err != nil {
-		writeErr(w, 400, err)
-		return
+	if !in.TestOnly {
+		s.UploadURL = strings.TrimSpace(in.URL)
 	}
-	res, err := Export(h, s.ExportDir)
-	if err != nil {
+	if err := SaveSettings(s); err != nil {
 		writeErr(w, 500, err)
 		return
 	}
-	writeJSON(w, res)
-}
-
-func (a *App) postOpen(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Which string }
-	if err := readJSON(r, &in); err != nil {
+	if s.UploadURL == "" {
+		writeJSON(w, map[string]any{"ok": false})
+		return
+	}
+	rm := NewRemote(s.UploadURL, s.UploadKey)
+	if err := rm.Ping(r.Context()); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
+	a.pub.SyncAll()
+	writeJSON(w, map[string]any{"ok": true, "hubUrl": rm.HubURL()})
+}
+
+func (a *App) adminPublish(w http.ResponseWriter, r *http.Request) {
+	a.pub.SyncAll()
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (a *App) imgLib(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	it, ok := a.lib.Get(q.Get("kind"), q.Get("id"))
+	if !ok || it.Image == "" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "max-age=60")
+	http.ServeFile(w, r, a.lib.ImagePath(it))
+}
+
+func (a *App) dlReceiver(w http.ResponseWriter, r *http.Request) {
 	s := LoadSettings()
-	dir := map[string]string{"packages": s.PackageDir, "export": s.ExportDir, "base": filepath.Dir(s.AdminBase), "ac": s.ACPath}[in.Which]
-	if dir == "" {
-		writeErr(w, 400, errors.New("pasta desconhecida"))
+	if s.UploadKey == "" {
+		s.UploadKey = NewKey()
+		_ = SaveSettings(s)
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="upload.php"`)
+	_, _ = w.Write(ReceiverPHP(s.UploadKey))
+}
+
+func (a *App) dlContentJSON(w http.ResponseWriter, r *http.Request) {
+	s := LoadSettings()
+	base, err := LoadAdminBase(s.AdminBase)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
 		return
 	}
-	if in.Which != "ac" {
-		_ = os.MkdirAll(dir, 0o755)
+	files := ""
+	if s.UploadURL != "" {
+		files = NewRemote(s.UploadURL, "").FilesURL()
 	}
-	if err := openExternal(dir); err != nil {
-		writeErr(w, 500, err)
+	b, err := CMContentJSON(BuildHub(base, a.lib, files), r.URL.Query().Get("room"))
+	if err != nil {
+		http.Error(w, err.Error(), 400)
 		return
 	}
-	writeJSON(w, map[string]string{"dir": dir})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="content.json"`)
+	_, _ = w.Write(b)
 }
 
 // openExternal opens a URL, custom protocol link or folder with the system
