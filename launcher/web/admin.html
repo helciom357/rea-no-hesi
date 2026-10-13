@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="token" content="{{TOKEN}}">
+<title>Painel da base · Launcher Brasil</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="brand"><span class="mark"><i></i></span> Painel da base <small>Launcher Brasil {{VERSION}}</small></div>
+    <div class="spacer"></div>
+    <div class="savebar">
+      <span class="dirty" id="dirty" hidden>Alterações não salvas</span>
+      <button class="btn primary" id="save">Salvar base</button>
+      <a class="btn ghost" href="/">Ver como jogador</a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap admin">
+  <nav class="nav" id="nav" aria-label="Seções">
+    <button data-sec="base">Base</button>
+    <button data-sec="modes">Modos de jogo</button>
+    <button data-sec="rooms">Salas</button>
+    <button data-sec="packages">Pacotes</button>
+    <button data-sec="publish">Publicar</button>
+    <button data-sec="paths">Pastas</button>
+  </nav>
+  <div id="content"></div>
+</main>
+
+<script src="/static/common.js"></script>
+<script src="/static/admin.js"></script>
+</body>
+</html>

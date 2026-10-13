@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="token" content="{{TOKEN}}">
+<title>Launcher Brasil</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="brand"><span class="mark"><i></i></span> Launcher Brasil <small id="baseName"></small></div>
+    <div class="spacer"></div>
+    <button class="btn ghost sm" id="refresh" title="Verificar de novo">Verificar de novo</button>
+    <button class="btn sm" id="openSettings">Ajustes</button>
+  </div>
+</header>
+
+<main class="wrap">
+  <div id="notices"></div>
+  <nav class="modes" id="modes" aria-label="Modos de jogo"></nav>
+  <div class="modebar" id="modebar"></div>
+  <section class="grid" id="rooms" aria-live="polite"></section>
+</main>
+
+<div class="dock" id="dock" hidden>
+  <div class="wrap">
+    <div class="row">
+      <strong id="dockTitle">Instalando</strong>
+      <span class="hint" id="dockSub"></span>
+      <div class="spacer"></div>
+      <button class="btn sm" id="dockCancel">Cancelar</button>
+      <button class="btn sm" id="dockClose" hidden>Fechar</button>
+    </div>
+    <div class="list" id="dockList"></div>
+  </div>
+</div>
+
+<dialog id="settings">
+  <form method="dialog">
+    <h2>Ajustes</h2>
+    <label class="field">Pasta do Assetto Corsa
+      <input type="text" name="acPath" placeholder="C:\Program Files (x86)\Steam\steamapps\common\assettocorsa">
+      <span class="hint" id="acHint"></span>
+    </label>
+    <label class="field">Base de servidores (link ou arquivo hub.json)
+      <input type="text" name="hubSource" placeholder="https://seusite.com.br/launcher/hub.json">
+      <span class="hint">O administrador da base informa este link. Um hub.json ao lado do .exe é usado automaticamente.</span>
+    </label>
+    <div class="actions">
+      <a class="btn ghost" href="/admin">Painel do administrador</a>
+      <div class="spacer"></div>
+      <button class="btn ghost" value="cancel">Cancelar</button>
+      <button class="btn primary" value="save" id="saveSettings">Salvar</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/static/common.js"></script>
+<script src="/static/player.js"></script>
+</body>
+</html>
